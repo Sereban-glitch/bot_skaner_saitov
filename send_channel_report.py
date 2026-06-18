@@ -16,6 +16,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_REPORT_CHAT = '@sereban_tech'
 HISTORY_FILE = BASE_DIR / 'report_stats.json'
 DANGER_MAP_FILE = BASE_DIR / 'danger_map.json'
+RISK_MAP_FILE = BASE_DIR / 'risk_map.json'  # 7-day history of risk-context mentions
 
 PLACE_KEYWORDS = [
     'запорожье', 'хортиц', 'коммунар', 'шевченков', 'александровск', 'правый', 'левый',
@@ -109,6 +110,62 @@ def update_danger_map(current_places: Counter):
 
     DANGER_MAP_FILE.write_text(json.dumps(cleaned_data, indent=2), encoding='utf-8')
     return cleaned_data
+
+
+def update_risk_map(current_risk_places: Counter):
+    """Update 7-day risk history: place -> {date: count}.
+    Same shape as update_danger_map, but only for risk-context mentions.
+    """
+    data = {}
+    if RISK_MAP_FILE.exists():
+        try:
+            data = json.loads(RISK_MAP_FILE.read_text(encoding='utf-8'))
+        except Exception:
+            data = {}
+
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    for place, count in current_risk_places.items():
+        if place not in data:
+            data[place] = {}
+        data[place][today_str] = data[place].get(today_str, 0) + count
+
+    # Keep only last 7 days
+    limit_date = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+    cleaned = {}
+    for place, history in data.items():
+        recent = {d: c for d, c in history.items() if d >= limit_date}
+        if recent:
+            cleaned[place] = recent
+
+    RISK_MAP_FILE.write_text(json.dumps(cleaned, indent=2, ensure_ascii=False))
+    return cleaned
+
+
+def get_risk_patterns(risk_map: dict, min_days: int = 3):
+    """Find places that appear on >=min_days in last 7 days.
+    Returns list of tuples: [(place, days_count, total_mentions, last_date, avg_per_day), ...]
+    Sorted by days_count DESC, then total_mentions DESC.
+    """
+    patterns = []
+    today = datetime.now().strftime('%Y-%m-%d')
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    for place, history in risk_map.items():
+        days_count = len(history)
+        total = sum(history.values())
+        if days_count < min_days:
+            continue
+        # Last seen date
+        last_date = max(history.keys())
+        # Is it active today or yesterday?
+        is_active_recently = last_date >= yesterday
+        # Average per active day
+        avg = total / days_count if days_count > 0 else 0
+        patterns.append((place, days_count, total, last_date, avg, is_active_recently))
+
+    # Sort: by days_count DESC, then total DESC
+    patterns.sort(key=lambda x: (-x[1], -x[2]))
+    return patterns
 
 
 def get_hotspots(map_data: dict):
@@ -230,6 +287,12 @@ async def main():
         map_data = update_danger_map(place_counts)
         hotspots = get_hotspots(map_data)
         risk_points = detect_risk_points(posts)
+        # Accumulate risk place counts for 7-day pattern analysis
+        risk_place_counts = Counter()
+        for place, count, _ in risk_points:
+            risk_place_counts[place] = count
+        risk_map = update_risk_map(risk_place_counts)
+        risk_patterns = get_risk_patterns(risk_map, min_days=3)
 
         lines = [
             f"📊 Аналитика: {env('CHANNEL_REPORT_TITLE', channel_ref)}",
@@ -258,6 +321,16 @@ async def main():
                 if sample:
                     lines.append(f'  └ "{sample}"')
             lines.append("\n🚨 Избегайте этих мест без документов (военный билет / приписное / справка).")
+
+        if risk_patterns:
+            lines.append("\n🔥 ПАТТЕРН РИСКА (повторяются 3+ дней за неделю):")
+            for place, days, total, last_date, avg, active in risk_patterns:
+                marker = "🔴" if active else "⚪"  # red if seen today/yesterday
+                lines.append(
+                    f"{marker} {place.upper()} — {days}/7 дн, {total} упом."
+                    f", посл. {last_date}, ~{avg:.1f}/дн"
+                )
+            lines.append("\n💡 Это места где ТЦК/полиция появляются регулярно. Обходить стороной.")
 
         new_words = words_counter.most_common(8)
         if new_words:

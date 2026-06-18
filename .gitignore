@@ -1,0 +1,5 @@
+.aider*
+.env
+risk_map.json
+danger_map.json
+cron_report.log
