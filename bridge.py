@@ -297,12 +297,54 @@ def single_instance(path: str):
 
 
 def strip_html(raw: str | None) -> str:
-    text = html.unescape(raw or "")
+    text = raw or ""
+    # CRITICAL: Remove script/style/nav/header/footer blocks BEFORE stripping tags
+    # Otherwise JS code leaks into the text and AI hallucinates
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<nav[^>]*>.*?</nav>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<header[^>]*>.*?</header>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<footer[^>]*>.*?</footer>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<noscript[^>]*>.*?</noscript>", " ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<!--.*?-->", " ", text, flags=re.DOTALL)
+    # Now strip remaining HTML tags
+    text = html.unescape(text)
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"\[\s*(?:…|\.{3})\s*\]$", "", text)
     text = text.replace("[…]", "").replace("[...]", "")
     return text.strip()
+
+
+def extract_article_body(html_content: str) -> str:
+    """Extract main article content from HTML.
+    Tries (in order):
+      1. <article> tag
+      2. WordPress entry-content div
+      3. <main> tag
+      4. Falls back to strip_html on full page
+    Returns cleaned text.
+    """
+    # Try <article> first (most semantic)
+    match = re.search(r"<article[^>]*>(.*?)</article>", html_content, re.DOTALL | re.IGNORECASE)
+    if match:
+        body = strip_html(match.group(1))
+        if len(body) > 500:  # sanity check
+            return body
+    # Try WordPress entry-content
+    match = re.search(r'class=["\']entry-content["\'][^>]*>(.*?)</div>\s*(?:</div>|<footer)', html_content, re.DOTALL | re.IGNORECASE)
+    if match:
+        body = strip_html(match.group(1))
+        if len(body) > 500:
+            return body
+    # Try <main>
+    match = re.search(r"<main[^>]*>(.*?)</main>", html_content, re.DOTALL | re.IGNORECASE)
+    if match:
+        body = strip_html(match.group(1))
+        if len(body) > 500:
+            return body
+    # Fallback: full page with improved strip_html
+    return strip_html(html_content)
 
 
 def shorten(text: str, limit: int = 500) -> str:
@@ -353,7 +395,8 @@ def case_number_in_post(case_numbers: list[str], post_text: str) -> bool:
 
 
 async def analyze_with_ai(html_content: str) -> str:
-    text = strip_html(html_content)
+    # Use extract_article_body to skip JS/CSS/nav and get real article content
+    text = extract_article_body(html_content)
     if len(text) < 200:
         return "FALLBACK"
     
@@ -382,6 +425,13 @@ async def analyze_with_ai(html_content: str) -> str:
   📂 Номер дела: не указан в источнике
 - Никогда не выдумывай номер дела. Только из источника.
 
+🚫 АНТИ-ГАЛЛЮЦИНАЦИЯ (КРИТИЧНО):
+- ИСПОЛЬЗУЙ ТОЛЬКО факты из предоставленного текста. Не выдумывай ничего.
+- Если текст не понятен или не содержит статьи — верни слово FALLBACK.
+- Не додумывай содержание по заголовку. Заголовок может быть двусмысленным.
+- Если в тексте идёт речь о судебном решении — пиши про судебное решение, а не про «деятельность» или «юбилей».
+- Если не уверен в факте — не включай его. Лучше короче, но точно.
+
 📝 СТРУКТУРА ПОСТА (Метод обратной пирамиды):
 1. Заголовок (цепляющий, отражающий суть новости/прецедента).
 2. Лид (самое важное в 1-2 предложениях).
@@ -394,7 +444,7 @@ async def analyze_with_ai(html_content: str) -> str:
 Не пиши приветствий, выводов или заключений от себя.
 
 Текст:
-""" + text[:5000]
+""" + text[:8000]
 
     try:
         async with aiohttp.ClientSession() as session:
