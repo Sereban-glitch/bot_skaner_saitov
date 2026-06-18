@@ -448,16 +448,14 @@ async def parse_rss_items(feed_url: str) -> list[dict[str, str]]:
         item_id = guid or link or title
         if not item_id or not link:
             continue
-            
-        # If AI successfully generated a post, it already includes a title/header.
-        # We don't want to duplicate the original feed title.
-        final_title = title if excerpt == shorten(description or content, 650) or excerpt == shorten(extract_article_excerpt(payload) or excerpt, 650) else ""
 
+        # Keep original title from feed. format_rss_post() will check
+        # if excerpt starts with the title (AI-generated) to avoid duplication.
         items.append(
             {
                 "id": item_id,
                 "guid": guid,
-                "title": final_title,
+                "title": title,
                 "link": link,
                 "excerpt": excerpt,
             }
@@ -467,9 +465,11 @@ async def parse_rss_items(feed_url: str) -> list[dict[str, str]]:
 
 def format_rss_post(item: dict[str, str]) -> str:
     parts = []
-    if item.get("title"):
-        parts.append(item["title"])
+    title = item.get("title", "").strip()
     excerpt = item.get("excerpt", "").strip()
+    # If excerpt already starts with title (AI-generated post), skip duplicating title
+    if title and not (excerpt and excerpt.startswith(title)):
+        parts.append(title)
     if excerpt:
         parts.append(excerpt)
     parts.append(f"Источник: {item['link']}")

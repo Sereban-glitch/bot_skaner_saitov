@@ -222,6 +222,40 @@ def format_hour_bar(count: int, max_count: int, width: int = 20) -> str:
     return '█' * filled + '░' * (width - filled)
 
 
+def analyze_rss_posts(posts: list) -> dict:
+    """Analyze posts that came from RSS (domdara.org).
+    RSS posts typically:
+      - Have AI-generated text (start with emoji like 🏛 ⚖ 📌 🛑)
+      - End with "Источник: http://domdara.org/..."
+    Returns: {total, ai_generated, fallback, sample_titles: [(time, title)]}
+    """
+    rss_posts = []
+    for p in posts:
+        text = p.text.strip()
+        # RSS posts end with domdara.org link
+        if 'domdara.org' in text.lower():
+            rss_posts.append(p)
+
+    ai_count = 0
+    fallback_count = 0
+    samples = []
+    for p in rss_posts:
+        first_line = p.text.split('\n')[0][:100]
+        # AI posts start with emoji (🏛 ⚖ 📌 🛑 🔥 📊)
+        if any(first_line.startswith(e) for e in ['🏛', '⚖', '📌', '🛑', '🔥', '📊', '🚨', '✅', '❌']):
+            ai_count += 1
+        else:
+            fallback_count += 1
+        samples.append((p.date.strftime('%H:%M'), first_line))
+
+    return {
+        'total': len(rss_posts),
+        'ai_generated': ai_count,
+        'fallback': fallback_count,
+        'samples': samples[:3],  # last 3
+    }
+
+
 def get_hotspots(map_data: dict):
     totals = Counter()
     for place, history in map_data.items():
@@ -356,6 +390,7 @@ async def main():
         risk_map = update_risk_map(risk_place_counts)
         risk_patterns = get_risk_patterns(risk_map, min_days=3)
         time_patterns = analyze_time_patterns(week_posts, days=7)
+        rss_stats = analyze_rss_posts(posts)
 
         lines = [
             f"📊 Аналитика: {env('CHANNEL_REPORT_TITLE', channel_ref)}",
@@ -425,6 +460,16 @@ async def main():
                 lines.append(f"  {h:02d}-{h+3:02d}  {bar} {count}")
 
             lines.append("\n💡 Планируйте поездки на спокойные часы. Избегайте пиковых.")
+
+        # RSS publication stats
+        if rss_stats and rss_stats['total'] > 0:
+            lines.append(f"\n📡 RSS (domdara.org → @svobodnye_ludi_zp):")
+            lines.append(f"Опубликовано сегодня: {rss_stats['total']} "
+                        f"(AI: {rss_stats['ai_generated']}, fallback: {rss_stats['fallback']})")
+            if rss_stats['samples']:
+                lines.append("Последние публикации:")
+                for time_str, title in rss_stats['samples']:
+                    lines.append(f"  {time_str}  {title}")
 
         new_words = words_counter.most_common(8)
         if new_words:
