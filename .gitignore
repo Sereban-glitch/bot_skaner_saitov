@@ -1,5 +1,44 @@
-.aider*
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Environment & secrets (NEVER commit)
 .env
-risk_map.json
-danger_map.json
+.env.bak*
+.env.example
+.mtproto-session.session
+.mtproto-session.session-journal
+analytics.session
+bridge.pid
+bridge.lock
+bridge.start.lock
+
+# Runtime data
+.rss-state.json
+processed_ids.json
+bridge.health.json
+bridge.log
 cron_report.log
+danger_map.json
+risk_map.json
+report_stats.json
+
+# Aider (AI coding tool)
+.aider*
+
+# Old scripts (utility, not tracked)
+healthcheck.sh
+logs.sh
+restart.sh
+start.sh
+status.sh
+stop.sh
+aider_instructions.txt
+GEMINI.md
+
+# Backups
+*.bak*
+bridge_patched.py
+patch_bridge.py
