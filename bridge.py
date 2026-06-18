@@ -321,12 +321,46 @@ async def fetch_url_text(url: str) -> str:
         print(f"fetch_url_text error: {e}")
         return ""
 
+# Regex for Ukrainian court case numbers
+CASE_NUMBER_PATTERNS = [
+    r'(?:дело|справа|производство|постановление|рішення)\s*№?\s*(\d+/\d+/\d+(?:/\d+)?)',
+    r'№\s*(\d{3,}/\d{4,}/\d{2,})',
+    r'(\d{3}/\d{4,}/\d{2,})',
+    r'(№\s*\d+[а-яА-Я]?/\d+/\d+)',
+]
+
+
+def extract_case_numbers(text: str) -> list[str]:
+    """Extract all case numbers from text. Returns list of unique matches."""
+    found = set()
+    for pattern in CASE_NUMBER_PATTERNS:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            num = match.group(1).strip()
+            if num and len(num) > 5:
+                found.add(num)
+    return sorted(found)
+
+
+def case_number_in_post(case_numbers: list[str], post_text: str) -> bool:
+    """Check if at least one case number is mentioned in the post."""
+    if not case_numbers:
+        return True
+    post_lower = post_text.lower()
+    for num in case_numbers:
+        if num in post_lower:
+            return True
+    return False
+
+
 async def analyze_with_ai(html_content: str) -> str:
     text = strip_html(html_content)
     if len(text) < 200:
         return "FALLBACK"
     
-    prompt = '''Ты — профессиональный Telegram-редактор и аналитик.
+    # Extract case numbers from source text BEFORE AI processing
+    source_case_numbers = extract_case_numbers(text)
+    case_numbers_str = ", ".join(source_case_numbers) if source_case_numbers else "не найден в источнике"
+    prompt = f"""Ты — профессиональный Telegram-редактор и аналитик.
 
 ТВОЯ ЗАДАЧА — сделать из текста крутой, профессиональный пост-выжимку.
 
@@ -337,46 +371,68 @@ async def analyze_with_ai(html_content: str) -> str:
 - Смести акценты ИСКЛЮЧИТЕЛЬНО на суть прецедента, интересные факты и судебную практику.
 - Убери любую политическую окраску и ругань.
 
+📂 ОБЯЗАТЕЛЬНО: НОМЕР ДЕЛА
+Номер судебного дела — это маркер достоверности. Без него пост выглядит как слух.
+Найденные в источнике номера дел: {case_numbers_str}
+
+ПРАВИЛА:
+- Если номер дела есть в источнике — ОБЯЗАТЕЛЬНО включи его в пост отдельной строкой:
+  📂 Номер дела: №753/19985/25
+- Если номер дела не найден — напиши:
+  📂 Номер дела: не указан в источнике
+- Никогда не выдумывай номер дела. Только из источника.
+
 📝 СТРУКТУРА ПОСТА (Метод обратной пирамиды):
 1. Заголовок (цепляющий, отражающий суть новости/прецедента).
 2. Лид (самое важное в 1-2 предложениях).
-3. Детали (интересные факты, практика).
-4. Значение (почему это важно читателю).
+3. 📂 Номер дела (ОБЯЗАТЕЛЬНО — отдельной строкой).
+4. Детали (интересные факты, практика).
+5. Значение (почему это важно читателю).
 
 ОФОРМЛЕНИЕ:
-Используй абзацы, маркированные списки и уместные эмодзи (⚖️, 📌, 📜, 🏛️, 📊).
+Используй абзацы, маркированные списки и уместные эмодзи (⚖️, 📌, 📜, 🏛️, 📊, 📂).
 Не пиши приветствий, выводов или заключений от себя.
 
 Текст:
-''' + text[:5000]
+""" + text[:5000]
 
     try:
         async with aiohttp.ClientSession() as session:
+            # IMPORTANT: proxy at :18080 is antigravity-claude-proxy (Anthropic API format)
+            # NOT OpenAI. Use /v1/messages with top-level "system" field.
             payload = {
                 "model": "gemini-3.5-flash-low",
                 "max_tokens": 4000,
-                "messages": [
-                    {"role": "system", "content": "Ты — профессиональный Telegram-редактор и аналитик. Твоя задача — делать крутые посты-выжимки, фильтровать агрессию, смещать акценты на суть прецедента. Тон нейтральный и объективный."},
-                    {"role": "user", "content": prompt}
-                ],
+                "system": "Ты — профессиональный Telegram-редактор и аналитик. Твоя задача — делать крутые посты-выжимки, фильтровать агрессию, смещать акценты на суть прецедента. Тон нейтральный и объективный. ВСЕГДА включай номер дела отдельной строкой.",
+                "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.3
             }
-            headers = {"Content-Type": "application/json"}
-            async with session.post("http://127.0.0.1:18080/v1/chat/completions", json=payload, headers=headers, timeout=45) as resp:
+            headers = {"Content-Type": "application/json", "x-api-key": "test"}
+            async with session.post("http://127.0.0.1:18080/v1/messages", json=payload, headers=headers, timeout=45) as resp:
                 data = await resp.json()
-                # OpenAI format: choices[0].message.content
-                if "choices" in data and len(data["choices"]) > 0:
-                    res = data["choices"][0].get("message", {}).get("content", "").strip()
-                    if "FALLBACK" in res.upper() and len(res) < 20:
-                        return "FALLBACK"
-                    return res
-                # Fallback: maybe Anthropic format still works
-                if "content" in data and len(data["content"]) > 0:
+                # Anthropic format: data["content"] = [{"type": "text", "text": "..."}, ...]
+                # Skip "thinking" blocks, take first "text" block
+                res = ""
+                if "content" in data and isinstance(data["content"], list):
                     for block in data["content"]:
-                        if block.get("type") == "text":
+                        if isinstance(block, dict) and block.get("type") == "text":
                             res = block.get("text", "").strip()
-                            if res and not ("FALLBACK" in res.upper() and len(res) < 20):
-                                return res
+                            break
+                if not res:
+                    return "FALLBACK"
+                if "FALLBACK" in res.upper() and len(res) < 20:
+                    return "FALLBACK"
+                # Validate: if source had case numbers, they MUST be in the post
+                if source_case_numbers and not case_number_in_post(source_case_numbers, res):
+                    case_line = "📂 Номер дела: " + ", ".join("№" + n for n in source_case_numbers)
+                    lines = res.split("\n")
+                    if len(lines) > 1:
+                        lines.insert(1, case_line)
+                    else:
+                        lines.append(case_line)
+                    res = "\n".join(lines)
+                    print(f"AI dropped case number — added manually: {source_case_numbers}", flush=True)
+                return res
     except Exception as e:
         print(f"AI error: {e}", flush=True)
     return "FALLBACK"
