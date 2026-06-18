@@ -30,6 +30,26 @@ EVENT_PATTERNS = {
     'блокировка': ['блокпост', 'стоп', 'окружили', 'вяжут', 'прессуют', 'документ'],
 }
 
+# Patterns that signal "document check" risk (TSCH/military/police stops).
+# When a post mentions a place + one of these → it's a risk point.
+RISK_EVENT_PATTERNS = [
+    'тцк', 'военком', 'военные', 'повестк', 'вручают', 'выписывают', 'раздают',
+    'проверка', 'проверяют', 'документ', 'паспорт', 'призыв',
+    'копы', 'синие', 'полиция', 'патруль', 'наряд',
+    'блокпост', 'стоп', 'окружили', 'вяжут', 'прессуют', 'задерж',
+    'военкомат', 'рейд', 'облава', 'кирпич', 'жёлтый',
+]
+
+# Additional place keywords specifically for risk points (districts, intersections).
+RISK_PLACE_KEYWORDS = PLACE_KEYWORDS + [
+    'плотина', 'дамба', 'шлюз', 'парк', 'кладбище', 'церковь', 'монастырь',
+    'автовокзал', 'ж/д', 'вокзал', 'станция', 'метро', 'трамвай',
+    'перекресток', 'развязка', 'поворот', 'светофор',
+    'запорожский', 'днепровский', 'хортицкий', 'шелковский',
+    'таврический', 'вознесеновский', 'александровский', 'бабуркинский',
+    'кольцо', 'круг', 'площадь', 'майдан', 'улица',
+]
+
 STOPWORDS = {
     'это', 'как', 'все', 'так', 'был', 'что', 'для', 'под', 'над', 'там', 'тут', 'если', 'уже', 'есть'
 }
@@ -96,6 +116,39 @@ def get_hotspots(map_data: dict):
     for place, history in map_data.items():
         totals[place] = sum(history.values())
     return totals.most_common(5)
+
+
+def detect_risk_points(posts: list) -> list:
+    """Detect places mentioned in posts that ALSO mention risk events
+    (TSCH, military, police, document checks, raids).
+
+    Returns list of tuples: [(place, count, sample_text), ...]
+    Sorted by count descending, top 7.
+    """
+    risk_place_counts = Counter()
+    risk_place_samples = {}
+
+    for post in posts:
+        text = post.text.lower()
+        # Check if post mentions ANY risk event
+        has_risk = any(p in text for p in RISK_EVENT_PATTERNS)
+        if not has_risk:
+            continue
+
+        # Find which risk place is mentioned
+        for place in RISK_PLACE_KEYWORDS:
+            if place in text:
+                risk_place_counts[place] += 1
+                # Save first 100 chars of post as sample (for context)
+                if place not in risk_place_samples:
+                    sample = post.text.strip().replace('\n', ' ')[:120]
+                    risk_place_samples[place] = sample
+
+    # Return top 7 with samples
+    result = []
+    for place, count in risk_place_counts.most_common(7):
+        result.append((place, count, risk_place_samples.get(place, '')))
+    return result
 
 
 def get_trend(current_score: int) -> str:
@@ -176,6 +229,7 @@ async def main():
 
         map_data = update_danger_map(place_counts)
         hotspots = get_hotspots(map_data)
+        risk_points = detect_risk_points(posts)
 
         lines = [
             f"📊 Аналитика: {env('CHANNEL_REPORT_TITLE', channel_ref)}",
@@ -196,6 +250,14 @@ async def main():
             lines.append("\n⚠️ ОЧАГИ ОПАСНОСТИ (за 7 дней):")
             for place, count in hotspots:
                 lines.append(f"- {place.upper()}: {count} инцидентов")
+
+        if risk_points:
+            lines.append("\n📍 ТОЧКИ РИСКА (проверяют документы):")
+            for place, count, sample in risk_points:
+                lines.append(f"• {place.upper()} — {count} упоминаний")
+                if sample:
+                    lines.append(f'  └ "{sample}"')
+            lines.append("\n🚨 Избегайте этих мест без документов (военный билет / приписное / справка).")
 
         new_words = words_counter.most_common(8)
         if new_words:
