@@ -51,6 +51,9 @@ RISK_PLACE_KEYWORDS = PLACE_KEYWORDS + [
     'кольцо', 'круг', 'площадь', 'майдан', 'улица',
 ]
 
+# Kyiv timezone (UTC+3, EEST during summer). Server is UTC, convert for local analysis.
+KYIV_TZ = timezone(timedelta(hours=3))
+
 STOPWORDS = {
     'это', 'как', 'все', 'так', 'был', 'что', 'для', 'под', 'над', 'там', 'тут', 'если', 'уже', 'есть'
 }
@@ -168,6 +171,57 @@ def get_risk_patterns(risk_map: dict, min_days: int = 3):
     return patterns
 
 
+def analyze_time_patterns(posts: list, days: int = 7) -> dict:
+    """Analyze when risk events happen during the day (Kyiv timezone).
+
+    Returns dict with:
+      - risk_hour_counts: {hour: count} for posts with risk events
+      - all_hour_counts: {hour: count} for all posts
+      - peak_hours: top 3 hours with most risk events
+      - quiet_hours: hours with lowest risk events (but >0)
+      - total_risk_posts: int
+      - total_posts: int
+      - days_analyzed: int
+    """
+    risk_hour_counts = Counter()
+    all_hour_counts = Counter()
+    risk_event_keywords = sum([RISK_EVENT_PATTERNS], [])  # flatten
+
+    for post in posts:
+        # Convert UTC to Kyiv time
+        kyiv_time = post.date.astimezone(KYIV_TZ)
+        hour = kyiv_time.hour
+        all_hour_counts[hour] += 1
+
+        text = post.text.lower()
+        if any(p in text for p in RISK_EVENT_PATTERNS):
+            risk_hour_counts[hour] += 1
+
+    # Find peak hours (top 3 by risk count)
+    peak = sorted(risk_hour_counts.items(), key=lambda x: -x[1])[:3]
+    # Find quiet hours (lowest with >0 risk events)
+    nonzero = [(h, c) for h, c in risk_hour_counts.items() if c > 0]
+    quiet = sorted(nonzero, key=lambda x: x[1])[:3]
+
+    return {
+        'risk_hour_counts': dict(risk_hour_counts),
+        'all_hour_counts': dict(all_hour_counts),
+        'peak_hours': peak,
+        'quiet_hours': quiet,
+        'total_risk_posts': sum(risk_hour_counts.values()),
+        'total_posts': len(posts),
+        'days_analyzed': days,
+    }
+
+
+def format_hour_bar(count: int, max_count: int, width: int = 20) -> str:
+    """Format a horizontal bar chart for hour distribution."""
+    if max_count == 0:
+        return ''
+    filled = int((count / max_count) * width)
+    return '█' * filled + '░' * (width - filled)
+
+
 def get_hotspots(map_data: dict):
     totals = Counter()
     for place, history in map_data.items():
@@ -254,25 +308,33 @@ async def main():
     report_chat = env('CHANNEL_REPORT_CHAT', DEFAULT_REPORT_CHAT)
     start_utc, end_utc, local_now = local_day_start()
 
+    # For time pattern analysis: fetch last 7 days
+    week_start_utc = end_utc - timedelta(days=7)
+
     try:
         entity = await client.get_entity(channel_ref)
-        posts = []
+        posts = []  # today's posts (for main stats)
+        week_posts = []  # last 7 days (for time patterns)
         words_counter = Counter()
         event_counts = Counter()
         place_counts = Counter()
 
         async for msg in client.iter_messages(entity, offset_date=end_utc):
-            if msg.date < start_utc:
+            if msg.date < week_start_utc:
                 break
             text = (msg.message or '').lower()
-            posts.append(PostStats(msg.id, msg.date, getattr(msg, 'views', 0) or 0, text))
+            post_obj = PostStats(msg.id, msg.date, getattr(msg, 'views', 0) or 0, text)
+            week_posts.append(post_obj)
 
-            for label, patterns in EVENT_PATTERNS.items():
-                if any(p in text for p in patterns):
-                    event_counts[label] += 1
-            for p in PLACE_KEYWORDS:
-                if p in text:
-                    place_counts[p] += 1
+            # Only today's posts go into main stats
+            if msg.date >= start_utc:
+                posts.append(post_obj)
+                for label, patterns in EVENT_PATTERNS.items():
+                    if any(p in text for p in patterns):
+                        event_counts[label] += 1
+                for p in PLACE_KEYWORDS:
+                    if p in text:
+                        place_counts[p] += 1
 
             all_known = set(sum(EVENT_PATTERNS.values(), []) + PLACE_KEYWORDS + list(STOPWORDS))
             words = re.findall(r'[а-яё]{5,}', text)
@@ -293,6 +355,7 @@ async def main():
             risk_place_counts[place] = count
         risk_map = update_risk_map(risk_place_counts)
         risk_patterns = get_risk_patterns(risk_map, min_days=3)
+        time_patterns = analyze_time_patterns(week_posts, days=7)
 
         lines = [
             f"📊 Аналитика: {env('CHANNEL_REPORT_TITLE', channel_ref)}",
@@ -331,6 +394,37 @@ async def main():
                     f", посл. {last_date}, ~{avg:.1f}/дн"
                 )
             lines.append("\n💡 Это места где ТЦК/полиция появляются регулярно. Обходить стороной.")
+
+        # Time patterns (based on 7 days of data)
+        if time_patterns and time_patterns['total_risk_posts'] > 0:
+            tp = time_patterns
+            lines.append(f"\n⏰ ВРЕМЕННЫЕ ПАТТЕРНЫ (за {tp['days_analyzed']} дн, риск-события по Киеву):")
+            lines.append(f"Всего риск-постов: {tp['total_risk_posts']} из {tp['total_posts']} ({100*tp['total_risk_posts']/max(tp['total_posts'],1):.0f}%)")
+
+            # Peak hours
+            if tp['peak_hours']:
+                lines.append("\n🔴 ПИКОВЫЕ ЧАСЫ (опасно):")
+                for hour, count in tp['peak_hours']:
+                    bar = format_hour_bar(count, tp['peak_hours'][0][1])
+                    lines.append(f"  {hour:02d}:00–{hour+1:02d}:00  {bar} {count}")
+
+            # Quiet hours
+            if tp['quiet_hours']:
+                lines.append("\n🟢 СПОКОЙНЫЕ ЧАСЫ (меньше риска):")
+                for hour, count in tp['quiet_hours']:
+                    bar = format_hour_bar(count, tp['peak_hours'][0][1] if tp['peak_hours'] else 1)
+                    lines.append(f"  {hour:02d}:00–{hour+1:02d}:00  {bar} {count}")
+
+            # Daily hour histogram (compact, every 3 hours)
+            lines.append("\n📊 Распределение по часам (Киев):")
+            rh = tp['risk_hour_counts']
+            max_count = max(rh.values()) if rh else 1
+            for h in range(0, 24, 3):
+                count = rh.get(h, 0) + rh.get(h+1, 0) + rh.get(h+2, 0)
+                bar = format_hour_bar(count, max_count * 3, width=15)
+                lines.append(f"  {h:02d}-{h+3:02d}  {bar} {count}")
+
+            lines.append("\n💡 Планируйте поездки на спокойные часы. Избегайте пиковых.")
 
         new_words = words_counter.most_common(8)
         if new_words:
