@@ -1071,8 +1071,8 @@ async def main(preview: bool = False):
     start_utc, end_utc, local_report_day = local_day_start()
 
     report_date = local_report_day.date()
-    history_start_date = report_date - timedelta(days=89)
-    history_start_utc = (local_report_day - timedelta(days=89)).astimezone(timezone.utc)
+    history_start_date = report_date - timedelta(days=90)
+    history_start_utc = (local_report_day - timedelta(days=90)).astimezone(timezone.utc)
 
     try:
         entity = await client.get_entity(channel_ref)
