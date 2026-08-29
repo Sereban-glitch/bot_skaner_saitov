@@ -1123,10 +1123,10 @@ async def main(preview: bool = False):
             day_key = (report_date - timedelta(days=offset)).isoformat()
             for hour, count in daily_summaries[day_key]['hourly_risk'].items():
                 weekly_hourly[int(hour)] += count
-                kyiv_tz = ZoneInfo('Europe/Kyiv')
+        kyiv_tz = ZoneInfo('Europe/Kyiv')
         
-        # Split history_posts + posts into records by Kyiv date
-        all_posts = build_novelty_posts(history_posts + posts)
+        # Split history_posts into records by Kyiv date
+        all_posts = build_novelty_posts(history_posts)
         
         report_records = []
         slang_recent_records = []
