@@ -527,6 +527,60 @@ class ReportAnalyticsTests(unittest.TestCase):
         self.assertIn("Точки за предыдущий день", detail)
         self.assertIn("Повторялись за последние 7 дней", detail)
 
+
+    def test_single_signal_is_labeled_unconfirmed(self):
+        from send_channel_report import format_unusual_signals
+        signal = UnusualSignal(
+            post_id=42,
+            date=datetime(2026, 8, 27, 12, tzinfo=timezone.utc),
+            location='Пески',
+            quote='Пески, ходят по домам',
+            action_code='HOME_VISIT',
+            severity=4,
+            reason_code='HIGH_SEVERITY_NEW',
+            baseline_messages=0,
+            current_messages=1,
+            novelty_score=5.0,
+        )
+        text = format_unusual_signals([signal], {})
+        self.assertIn('Необычные сигналы', text)
+        self.assertIn('Одно публичное сообщение, не подтверждение.', text)
+        self.assertIn(signal.quote, text)
+
+    def test_slang_section_is_omitted_when_empty(self):
+        detail = build_detail_report(
+            risk_points=[],
+            risk_patterns=[],
+            unusual_signals_text='',
+            slang_text='',
+        )
+        self.assertNotIn('Возможный новый сленг', detail)
+
+    def test_slang_section_shows_at_most_three_candidates(self):
+        from send_channel_report import format_slang_candidates
+        from report_novelty import SlangCandidate
+        candidates = [
+            SlangCandidate(
+                token=f'слово{index}',
+                recent_messages=7,
+                baseline_weekly_rate=0.0,
+                sample_post_id=index,
+                sample_text=f'контекст слово{index}',
+            )
+            for index in range(5)
+        ]
+        text = format_slang_candidates(candidates)
+        self.assertEqual(text.count('сообщений за 7 дней'), 3)
+
+    def test_novelty_sections_stay_inside_utf16_limit(self):
+        detail = build_detail_report(
+            risk_points=[('Пески', 1, 'цитата ' + '😀' * 1000)],
+            risk_patterns=[('Пески', 3, 5, '2026-08-27', 1.7, True)],
+            unusual_signals_text='⚠️ Необычные сигналы\n' + '😀' * 3000,
+            slang_text='🆕 Возможный новый сленг\n' + '😀' * 3000,
+        )
+        self.assertLessEqual(telegram_text_units(detail), 4096)
+
     def test_detail_report_respects_telegram_utf16_limit(self):
         detail = build_detail_report(
             risk_points=[("Точка", 1, "😀" * 3000)],

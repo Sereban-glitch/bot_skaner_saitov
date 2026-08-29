@@ -95,3 +95,42 @@ class UnusualSignalTests(unittest.TestCase):
             (1, 'FORCE'),
             (2, 'HOME_VISIT'),
         ])
+
+
+class NoveltyBuilderTests(unittest.TestCase):
+    def test_build_known_terms_includes_stopwords_and_patterns(self):
+        from send_channel_report import build_known_terms
+        terms = build_known_terms()
+        self.assertIn('это', terms)
+        self.assertIn('тцк', terms)
+        self.assertIn('космос', terms)
+
+    def test_build_novelty_posts_extracts_locations_and_events(self):
+        from send_channel_report import build_novelty_posts, PostStats
+        from datetime import datetime, timezone
+        posts = [
+            PostStats(
+                id=1,
+                date=datetime(2026, 8, 27, 12, tzinfo=timezone.utc),
+                views=10,
+                text="Пески, за АТБ стоят ТЦК, проверяют документы"
+            ),
+            PostStats(
+                id=2,
+                date=datetime(2026, 8, 27, 13, tzinfo=timezone.utc),
+                views=10,
+                text="На улице просто дождь"
+            )
+        ]
+        novelty_posts = build_novelty_posts(posts)
+        
+        self.assertEqual(len(novelty_posts), 2)
+        p1, p2 = novelty_posts
+        
+        self.assertEqual(p1.id, 1)
+        self.assertIn("АТБ - Пески", p1.locations)
+        self.assertIn("тцк/военные", p1.event_types)
+        
+        self.assertEqual(p2.id, 2)
+        self.assertEqual(p2.locations, ())
+        self.assertEqual(p2.event_types, ())

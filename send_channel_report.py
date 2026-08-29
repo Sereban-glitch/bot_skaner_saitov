@@ -15,7 +15,7 @@ from pathlib import Path
 
 from telethon import TelegramClient
 
-from report_novelty import UnusualSignal
+from report_novelty import UnusualSignal, NoveltyPost, find_unusual_signals, find_slang_candidates
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_REPORT_CHAT = '@sereban_tech'
@@ -404,6 +404,79 @@ def update_daily_history(
     return history
 
 
+
+REASON_TEXT = {
+    'HIGH_SEVERITY_NEW': 'Серьёзное действие почти не встречалось в предыдущие 90 дней.',
+    'NEW_LOCATION_ACTION': 'Такое действие ранее не встречалось в этой распознанной точке.',
+    'FREQUENCY_SPIKE': 'За сутки сообщений заметно больше обычной недельной частоты.',
+    'RARE_ACTION': 'Действие почти не встречалось в предыдущие 90 дней.',
+}
+
+def build_known_terms() -> set[str]:
+    terms = set(STOPWORDS)
+    for category in EVENT_PATTERNS.values():
+        for pattern in category:
+            terms.update(word.strip() for word in pattern.split())
+    for k, aliases in ZAPORIZHZHIA_LOCATIONS.items():
+        terms.update(word.strip() for word in k.split())
+        for alias in aliases:
+            terms.update(word.strip() for word in alias.split())
+    for k in GENERIC_PLACE_KEYWORDS:
+        terms.update(word.strip() for word in k.split())
+    for label, alias in SPECIFIC_LOCATION_LABELS:
+        terms.update(word.strip() for word in label.split())
+        terms.update(word.strip() for word in alias.split())
+    channel_vocab = ['отправьте', 'информацию', 'сообщение', 'бот', 'анонимно', 'спасибо', 'пожалуйста', 'админ']
+    terms.update(channel_vocab)
+    return {term.lower() for term in terms if term}
+
+def build_novelty_posts(posts: list[PostStats]) -> list[NoveltyPost]:
+    novelty_posts = []
+    for post in posts:
+        locations = extract_contextual_locations(post.text)
+        lowered = post.text.lower()
+        event_types = []
+        if any(pattern in lowered for pattern in RISK_EVENT_PATTERNS):
+            for label, patterns in EVENT_PATTERNS.items():
+                if any(pattern in lowered for pattern in patterns):
+                    event_types.append(label)
+        novelty_posts.append(NoveltyPost(
+            id=post.id,
+            date=post.date,
+            text=post.text,
+            locations=tuple(locations),
+            event_types=tuple(event_types)
+        ))
+    return novelty_posts
+
+def format_unusual_signals(signals, reason_codes) -> str:
+    if not signals:
+        return ''
+    kyiv_tz = ZoneInfo('Europe/Kyiv')
+    lines = ['⚠️ **Необычные сигналы**', '_Одно публичное сообщение, не подтверждение._', '']
+    for signal in signals:
+        local_time = signal.date.astimezone(kyiv_tz)
+        time_str = f"{local_time.hour:02d}:{local_time.minute:02d}"
+        reason = reason_codes.get(signal.post_id) or signal.reason_code
+        reason_text = REASON_TEXT.get(reason, '')
+        
+        lines.append(f"• {time_str}, {signal.location}:")
+        lines.append(f"«{signal.quote}»")
+        if reason_text:
+            lines.append(f"_{reason_text}_")
+        lines.append("")
+    return '\n'.join(lines).strip()
+
+def format_slang_candidates(candidates) -> str:
+    if not candidates:
+        return ''
+    lines = ['🆕 **Возможный новый сленг**']
+    for candidate in candidates[:3]:
+        lines.append(f'• **{candidate.token}** ({candidate.recent_messages} сообщений за 7 дней)')
+        lines.append(f'  «{candidate.sample_text}»')
+    return '\n'.join(lines)
+
+
 def analyze_daily_history(report_date, history: dict) -> dict:
     dated_values = {
         datetime.strptime(day, '%Y-%m-%d').date(): data.get('risk_posts', 0)
@@ -749,6 +822,8 @@ def build_detail_report(
     *,
     risk_points: list,
     risk_patterns: list,
+    unusual_signals_text: str = '',
+    slang_text: str = '',
 ) -> str:
     lines = ['📍 **Точки за предыдущий день**']
     if risk_points:
@@ -772,7 +847,38 @@ def build_detail_report(
     else:
         lines.append('- Точек с упоминаниями минимум в 3 разные дня нет.')
 
-    return truncate_telegram_text('\n'.join(lines))
+    base_text = '\n'.join(lines)
+    
+    if unusual_signals_text:
+        base_text += '\n\n' + unusual_signals_text
+    if slang_text:
+        base_text += '\n\n' + slang_text
+        
+    if telegram_text_units(base_text) <= 4096:
+        return base_text
+        
+    # Priority truncation: Drop slang text first
+    base_text = '\n'.join(lines)
+    if unusual_signals_text:
+        base_text += '\n\n' + unusual_signals_text
+        
+    if telegram_text_units(base_text) <= 4096:
+        return base_text
+        
+    # Still too long: strip AI reasons from unusual signals
+    if unusual_signals_text:
+        filtered_unusual = []
+        for line in unusual_signals_text.split('\n'):
+            is_reason = False
+            for reason in REASON_TEXT.values():
+                if reason in line:
+                    is_reason = True
+                    break
+            if not is_reason:
+                filtered_unusual.append(line)
+        base_text = '\n'.join(lines) + '\n\n' + '\n'.join(filtered_unusual).strip()
+
+    return truncate_telegram_text(base_text)
 
 
 def build_dashboard(
@@ -1017,7 +1123,53 @@ async def main(preview: bool = False):
             day_key = (report_date - timedelta(days=offset)).isoformat()
             for hour, count in daily_summaries[day_key]['hourly_risk'].items():
                 weekly_hourly[int(hour)] += count
+                kyiv_tz = ZoneInfo('Europe/Kyiv')
+        
+        # Split history_posts + posts into records by Kyiv date
+        all_posts = build_novelty_posts(history_posts + posts)
+        
+        report_records = []
+        slang_recent_records = []
+        slang_comparison_records = []
+        anomaly_baseline_records = []
+        
+        for p in all_posts:
+            local_date = p.date.astimezone(kyiv_tz).date()
+            if local_date == report_date:
+                report_records.append(p)
+            
+            if report_date - timedelta(days=6) <= local_date <= report_date:
+                slang_recent_records.append(p)
+                
+            if report_date - timedelta(days=34) <= local_date <= report_date - timedelta(days=7):
+                slang_comparison_records.append(p)
+                
+            if report_date - timedelta(days=90) <= local_date <= report_date - timedelta(days=1):
+                anomaly_baseline_records.append(p)
+                
+        known_terms = build_known_terms()
+        unusual_signals = find_unusual_signals(
+            report_records,
+            anomaly_baseline_records,
+            limit=5
+        )
+        
+        slang_candidates = find_slang_candidates(
+            slang_recent_records,
+            slang_comparison_records,
+            known_terms
+        )
+        
+        ai_settings = load_ai_settings()
+        reason_codes = {}
+        if unusual_signals and ai_settings:
+            reason_codes = await ask_ai_for_signal_reasons(unusual_signals, ai_settings)
+            
+        unusual_signals_text = format_unusual_signals(unusual_signals, reason_codes)
+        slang_text = format_slang_candidates(slang_candidates)
+        
         dashboard = build_dashboard(
+
             title=env('CHANNEL_REPORT_TITLE', channel_ref),
             report_date=report_date,
             total_posts=current_summary['total_posts'],
@@ -1031,6 +1183,8 @@ async def main(preview: bool = False):
         detail = build_detail_report(
             risk_points=risk_points,
             risk_patterns=risk_patterns,
+            unusual_signals_text=unusual_signals_text,
+            slang_text=slang_text,
         )
 
         if preview:
