@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+.worktrees/
 
 # Environment & secrets (NEVER commit)
 .env
