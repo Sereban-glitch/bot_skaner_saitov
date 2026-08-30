@@ -972,6 +972,7 @@ def build_detail_report(
 
 
 def build_dashboard(
+    history_posts: list[PostStats],
     *,
     title: str,
     report_date,
@@ -985,12 +986,21 @@ def build_dashboard(
     def display_number(value) -> str:
         return f'{value:g}'.replace('.', ',')
 
+    # Calculate safety windows for tomorrow based on whether tomorrow is a weekend
+    tomorrow = report_date + timedelta(days=2) # report_date is yesterday, so tomorrow is +2 days
+    safety = calculate_safety_windows(history_posts, tomorrow)
+
     lines = [
-        f'📊 **Сводка за предыдущий день: {title}**',
-        f'📅 {report_date:%d.%m.%Y}, 00:00-24:00 по Киеву',
+        f'📊 **Статистика и прогноз: {title}**',
+        f'📅 Вчера ({report_date:%d.%m.%Y}), 00:00-24:00 по Киеву',
         '',
         f'📝 Всего сообщений в канале: {total_posts}',
         f'⚠️ Сообщений о проверках: {risk_posts}',
+        '',
+        f'🛡 **Прогноз на завтра ({safety["day_type"]}, на базе 90 дней):**',
+        f'✅ Окна затишья: {safety["safe_windows"]}',
+        f'⛔ Высокий риск: {safety["high_risk"]}',
+        f'🌙 Комендантский час: 00:00-05:00 (любые перемещения опасны)',
     ]
 
     if event_counts:
@@ -1259,6 +1269,7 @@ async def main(preview: bool = False):
         slang_text = format_slang_candidates(slang_candidates)
         
         dashboard = build_dashboard(
+            history_posts=history_posts,
 
             title=env('CHANNEL_REPORT_TITLE', channel_ref),
             report_date=report_date,

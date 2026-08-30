@@ -333,6 +333,7 @@ class ReportAnalyticsTests(unittest.TestCase):
         }
 
         dashboard = build_dashboard(
+            history_posts=[],
             title="Запорожье",
             report_date=date(2026, 8, 27),
             total_posts=90,
@@ -343,8 +344,8 @@ class ReportAnalyticsTests(unittest.TestCase):
             comparison=comparison,
         )
 
-        self.assertIn("Сводка за предыдущий день", dashboard)
-        self.assertIn("27.08.2026, 00:00-24:00", dashboard)
+        self.assertIn("Статистика и прогноз", dashboard)
+        self.assertIn("Вчера (27.08.2026), 00:00-24:00", dashboard)
         self.assertIn("На 6 сообщений больше, чем позавчера (+27%).", dashboard)
         self.assertIn("За последние 7 дней: 124", dashboard)
         self.assertIn("По истории за 90 дней", dashboard)
@@ -367,6 +368,7 @@ class ReportAnalyticsTests(unittest.TestCase):
 
     def test_weekend_comparison_uses_the_lower_average_as_baseline(self):
         dashboard = build_dashboard(
+            history_posts=[],
             title="Запорожье",
             report_date=date(2026, 8, 27),
             total_posts=10,
@@ -391,6 +393,7 @@ class ReportAnalyticsTests(unittest.TestCase):
 
     def test_zero_baselines_are_explained_instead_of_hidden(self):
         dashboard = build_dashboard(
+            history_posts=[],
             title="Запорожье",
             report_date=date(2026, 8, 27),
             total_posts=10,
@@ -416,6 +419,7 @@ class ReportAnalyticsTests(unittest.TestCase):
 
     def test_all_zero_comparisons_are_explicit(self):
         dashboard = build_dashboard(
+            history_posts=[],
             title="Запорожье",
             report_date=date(2026, 8, 27),
             total_posts=0,
