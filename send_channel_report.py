@@ -913,63 +913,434 @@ def build_detail_report(
     *,
     risk_points: list,
     risk_patterns: list,
-    unusual_signals_text: str = '',
-    slang_text: str = '',
+    unusual_signals_text: str = "",
+    slang_text: str = "",
+    weekly_hourly: dict = None,
 ) -> str:
-    lines = ['📍 **Точки за предыдущий день**']
-    if risk_points:
-        for place, count, sample in risk_points[:7]:
-            noun = russian_plural(count, 'сообщение', 'сообщения', 'сообщений')
-            lines.append(f'**{place[:120]}: {count} {noun}**')
-            if sample:
-                lines.append(f'«{sample[:240]}»')
-    else:
-        lines.append('Конкретные точки в сообщениях не распознаны.')
-
-    lines.extend(['', '**Повторялись за последние 7 дней:**'])
-    if risk_patterns:
-        for place, days_count, total, _, _, _ in risk_patterns[:7]:
-            day_noun = russian_plural(days_count, 'день', 'дня', 'дней')
-            message_noun = russian_plural(total, 'сообщение', 'сообщения', 'сообщений')
-            lines.append(
-                f'- {place}: {days_count} {day_noun} из 7, '
-                f'всего {total} {message_noun}.'
-            )
-    else:
-        lines.append('- Точек с упоминаниями минимум в 3 разные дня нет.')
-
-    base_text = '\n'.join(lines)
+    lines = []
     
-    if unusual_signals_text:
-        base_text += '\n\n' + unusual_signals_text
-    if slang_text:
-        base_text += '\n\n' + slang_text
+    if risk_patterns:
+        lines.append("⚠️ ОЧАГИ ОПАСНОСТИ (за 7 дней):")
+        for pat in risk_patterns[:5]:
+            verified_tag = " [ПОДТВЕРЖДЕНО]" if pat.get("verified") else ""
+            lines.append(f"- {pat['place'].upper()}: {pat['total_mentions']} инцидентов{verified_tag}")
+        lines.append("")
+    
+    if risk_points:
+        lines.append("📍 ТОЧКИ РИСКА (Вчера):")
+        for place, count, details in risk_points[:7]:
+            lines.append(f"• {place.upper()} — {count} {russian_plural(count, 'упоминание', 'упоминания', 'упоминаний')}")
+            samples = details.get("posts", [])[:1]
+            for sample in samples:
+                clean_sample = sample.text.replace("\n", " ")
+                lines.append(f"  └ \"{truncate_telegram_text(clean_sample, 100).lower()}\"")
+        lines.append("")
         
-    if telegram_text_units(base_text) <= 4096:
-        return base_text
+    lines.append("⏰ ВРЕМЕННЫЕ ПАТТЕРНЫ (за 7 дн):")
+    if weekly_hourly:
+        max_weekly_count = max(weekly_hourly.values()) if weekly_hourly.values() else 0
+        top_weekly = sorted(weekly_hourly.items(), key=lambda x: x[1], reverse=True)[:3]
         
-    # Priority truncation: Drop slang text first
-    base_text = '\n'.join(lines)
-    if unusual_signals_text:
-        base_text += '\n\n' + unusual_signals_text
-        
-    if telegram_text_units(base_text) <= 4096:
-        return base_text
-        
-    # Still too long: strip AI reasons from unusual signals
-    if unusual_signals_text:
-        filtered_unusual = []
-        for line in unusual_signals_text.split('\n'):
-            is_reason = False
-            for reason in REASON_TEXT.values():
-                if reason in line:
-                    is_reason = True
-                    break
-            if not is_reason:
-                filtered_unusual.append(line)
-        base_text = '\n'.join(lines) + '\n\n' + '\n'.join(filtered_unusual).strip()
+        lines.append("🔴 ПИКОВЫЕ ЧАСЫ (опасно):")
+        for h, count in top_weekly:
+            if count > 0:
+                bar = format_hour_bar(count, max_weekly_count, width=20)
+                lines.append(f"  {h:02d}:00–{(h+1):02d}:00  {bar} {count}")
+            
+        lines.append("")
+        lines.append("🟢 СПОКОЙНЫЕ ЧАСЫ (меньше риска):")
+        bottom_weekly = sorted([x for x in weekly_hourly.items() if x[1] > 0], key=lambda x: x[1])[:3]
+        for h, count in bottom_weekly:
+            bar = format_hour_bar(count, max_weekly_count, width=20)
+            lines.append(f"  {h:02d}:00–{(h+1):02d}:00  {bar} {count}")
+            
+        lines.append("")
+        lines.append("📊 Распределение по часовым блокам (Киев):")
+        blocks = {f"{i:02d}-{(i+3):02d}": sum(weekly_hourly.get(h, 0) for h in range(i, i+3)) for i in range(0, 24, 3)}
+        max_block = max(blocks.values()) if blocks.values() else 0
+        for b_label, count in blocks.items():
+            bar = format_hour_bar(count, max_block, width=15)
+            lines.append(f"  {b_label}  {bar} {count}")
+            
+    lines.append("")
 
-    return truncate_telegram_text(base_text)
+    if unusual_signals_text:
+        lines.append(unusual_signals_text)
+        lines.append("")
+
+    if slang_text:
+        lines.append(slang_text)
+
+    return "\n".join(lines).strip()
+
+def format_unusual_signals(signals, reason_codes) -> str:
+    if not signals:
+        return ''
+    kyiv_tz = ZoneInfo('Europe/Kyiv')
+    lines = ['⚠️ **Необычные сигналы**', '_Одно публичное сообщение, не подтверждение._', '']
+    for signal in signals:
+        local_time = signal.date.astimezone(kyiv_tz)
+        time_str = f"{local_time.hour:02d}:{local_time.minute:02d}"
+        reason = reason_codes.get(signal.post_id) or signal.reason_code
+        reason_text = REASON_TEXT.get(reason, '')
+        
+        lines.append(f"• {time_str}, {signal.location}:")
+        lines.append(f"«{signal.quote}»")
+        if reason_text:
+            lines.append(f"_{reason_text}_")
+        lines.append("")
+    return '\n'.join(lines).strip()
+
+def format_slang_candidates(candidates) -> str:
+    if not candidates:
+        return ''
+    lines = ['🆕 **Возможный новый сленг**']
+    for candidate in candidates[:3]:
+        lines.append(f'• **{candidate.token}** ({candidate.recent_messages} сообщений за 7 дней)')
+        lines.append(f'  «{candidate.sample_text}»')
+    return '\n'.join(lines)
+
+
+def analyze_daily_history(report_date, history: dict) -> dict:
+    dated_values = {
+        datetime.strptime(day, '%Y-%m-%d').date(): data.get('risk_posts', 0)
+        for day, data in history.items()
+        if day <= report_date.isoformat()
+    }
+    previous_date = report_date - timedelta(days=1)
+    prior_values = {
+        day: value for day, value in dated_values.items() if day < report_date
+    }
+    same_weekday = [
+        value for day, value in prior_values.items()
+        if day.weekday() == report_date.weekday()
+    ]
+    workdays = [value for day, value in prior_values.items() if day.weekday() < 5]
+    weekends = [value for day, value in prior_values.items() if day.weekday() >= 5]
+
+    def average(values):
+        return round(sum(values) / len(values), 1) if values else None
+
+    def period_total(start_offset: int, end_offset: int) -> int:
+        return sum(
+            dated_values.get(report_date - timedelta(days=offset), 0)
+            for offset in range(start_offset, end_offset + 1)
+        )
+
+    return {
+        'previous_day': dated_values.get(previous_date),
+        'weekday_average': average(same_weekday),
+        'workday_average': average(workdays),
+        'weekend_average': average(weekends),
+        'last_7_total': period_total(0, 6),
+        'previous_7_total': period_total(7, 13),
+        'last_14_average': average([
+            dated_values.get(report_date - timedelta(days=offset), 0)
+            for offset in range(0, 14)
+        ]),
+        'previous_14_average': average([
+            dated_values.get(report_date - timedelta(days=offset), 0)
+            for offset in range(14, 28)
+        ]),
+    }
+
+
+
+
+def merge_place_history(
+    data: dict,
+    date_str: str,
+    current_places: Counter,
+    keep_days: int,
+) -> dict:
+    for history in data.values():
+        history.pop(date_str, None)
+    for place, count in current_places.items():
+        if count > 0:
+            data.setdefault(place, {})[date_str] = count
+
+    report_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+    limit_date = (report_date - timedelta(days=keep_days - 1)).isoformat()
+    cleaned = {}
+    for place, history in data.items():
+        recent = {day: count for day, count in history.items() if day >= limit_date}
+        if recent:
+            cleaned[place] = recent
+    return cleaned
+
+
+def update_danger_map(current_places: Counter, date_str: str | None = None):
+    data = {}
+    if DANGER_MAP_FILE.exists():
+        try:
+            data = json.loads(DANGER_MAP_FILE.read_text(encoding='utf-8'))
+        except Exception:
+            data = {}
+
+    date_str = date_str or datetime.now(ZoneInfo('Europe/Kyiv')).date().isoformat()
+    cleaned_data = merge_place_history(data, date_str, current_places, keep_days=7)
+
+    DANGER_MAP_FILE.write_text(json.dumps(cleaned_data, indent=2), encoding='utf-8')
+    return cleaned_data
+
+
+def update_risk_map(current_risk_places: Counter, date_str: str | None = None):
+    """Update 7-day risk history: place -> {date: count}.
+    Same shape as update_danger_map, but only for risk-context mentions.
+    """
+    data = {}
+    if RISK_MAP_FILE.exists():
+        try:
+            data = json.loads(RISK_MAP_FILE.read_text(encoding='utf-8'))
+        except Exception:
+            data = {}
+
+    date_str = date_str or datetime.now(ZoneInfo('Europe/Kyiv')).date().isoformat()
+    cleaned = merge_place_history(data, date_str, current_risk_places, keep_days=7)
+
+    RISK_MAP_FILE.write_text(json.dumps(cleaned, indent=2, ensure_ascii=False))
+    return cleaned
+
+
+def get_risk_patterns(risk_map: dict, min_days: int = 3):
+    """Find places that appear on >=min_days in last 7 days.
+    Returns list of tuples: [(place, days_count, total_mentions, last_date, avg_per_day), ...]
+    Sorted by days_count DESC, then total_mentions DESC.
+    """
+    patterns = []
+    today = datetime.now().strftime('%Y-%m-%d')
+    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+    for place, history in risk_map.items():
+        days_count = len(history)
+        total = sum(history.values())
+        if days_count < min_days:
+            continue
+        # Last seen date
+        last_date = max(history.keys())
+        # Is it active today or yesterday?
+        is_active_recently = last_date >= yesterday
+        # Average per active day
+        avg = total / days_count if days_count > 0 else 0
+        patterns.append((place, days_count, total, last_date, avg, is_active_recently))
+
+    # Sort: by days_count DESC, then total DESC
+    patterns.sort(key=lambda x: (-x[1], -x[2]))
+    return patterns
+
+
+def analyze_time_patterns(posts: list, days: int = 7) -> dict:
+    """Analyze when risk events happen during the day (Kyiv timezone).
+
+    Returns dict with:
+      - risk_hour_counts: {hour: count} for posts with risk events
+      - all_hour_counts: {hour: count} for all posts
+      - peak_hours: top 3 hours with most risk events
+      - quiet_hours: hours with lowest risk events (but >0)
+      - total_risk_posts: int
+      - total_posts: int
+      - days_analyzed: int
+    """
+    risk_hour_counts = Counter()
+    all_hour_counts = Counter()
+    risk_event_keywords = sum([RISK_EVENT_PATTERNS], [])  # flatten
+
+    for post in posts:
+        # Convert UTC to Kyiv time
+        kyiv_time = post.date.astimezone(KYIV_TZ)
+        hour = kyiv_time.hour
+        all_hour_counts[hour] += 1
+
+        text = post.text.lower()
+        if is_risk_post(text):
+            risk_hour_counts[hour] += 1
+
+    # Find peak hours (top 3 by risk count)
+    peak = sorted(risk_hour_counts.items(), key=lambda x: -x[1])[:3]
+    # Find quiet hours (lowest with >0 risk events)
+    nonzero = [(h, c) for h, c in risk_hour_counts.items() if c > 0]
+    quiet = sorted(nonzero, key=lambda x: x[1])[:3]
+
+    return {
+        'risk_hour_counts': dict(risk_hour_counts),
+        'all_hour_counts': dict(all_hour_counts),
+        'peak_hours': peak,
+        'quiet_hours': quiet,
+        'total_risk_posts': sum(risk_hour_counts.values()),
+        'total_posts': len(posts),
+        'days_analyzed': days,
+    }
+
+
+def format_hour_bar(count: int, max_count: int, width: int = 20) -> str:
+    """Format a horizontal bar chart for hour distribution."""
+    if max_count == 0:
+        return ''
+    filled = int((count / max_count) * width)
+    return '█' * filled + '░' * (width - filled)
+
+
+def analyze_rss_posts(posts: list) -> dict:
+    """Analyze posts that came from RSS (domdara.org).
+    RSS posts typically:
+      - Have AI-generated text (start with emoji like 🏛 ⚖ 📌 🛑)
+      - End with "Источник: http://domdara.org/..."
+    Returns: {total, ai_generated, fallback, sample_titles: [(time, title)]}
+    """
+    rss_posts = []
+    for p in posts:
+        text = p.text.strip()
+        # RSS posts end with domdara.org link
+        if 'domdara.org' in text.lower():
+            rss_posts.append(p)
+
+    ai_count = 0
+    fallback_count = 0
+    samples = []
+    for p in rss_posts:
+        first_line = p.text.split('\n')[0][:100]
+        # AI posts start with emoji (🏛 ⚖ 📌 🛑 🔥 📊)
+        if any(first_line.startswith(e) for e in ['🏛', '⚖', '📌', '🛑', '🔥', '📊', '🚨', '✅', '❌']):
+            ai_count += 1
+        else:
+            fallback_count += 1
+        samples.append((p.date.strftime('%H:%M'), first_line))
+
+    return {
+        'total': len(rss_posts),
+        'ai_generated': ai_count,
+        'fallback': fallback_count,
+        'samples': samples[:3],  # last 3
+    }
+
+
+def get_hotspots(map_data: dict):
+    totals = Counter()
+    for place, history in map_data.items():
+        totals[place] = sum(history.values())
+    return totals.most_common(5)
+
+
+def detect_risk_points(posts: list, limit: int | None = 7) -> list:
+    """Detect places mentioned in posts that ALSO mention risk events
+    (TSCH, military, police, document checks, raids).
+
+    Returns list of tuples: [(place, count, sample_text), ...]
+    Sorted by count descending, top 7.
+    """
+    risk_place_counts = Counter()
+    risk_place_samples = {}
+
+    for post in posts:
+        text = post.text.lower()
+        # Check if post mentions ANY risk event
+        has_risk = is_risk_post(text)
+        if not has_risk:
+            continue
+
+        contextual_locations = extract_contextual_locations(post.text)
+        if contextual_locations:
+            for place in contextual_locations:
+                risk_place_counts[place] += 1
+                risk_place_samples.setdefault(
+                    place,
+                    post.text.strip().replace('\n', ' ')[:240],
+                )
+            continue
+
+        # Find which risk place is mentioned
+        for place in RISK_PLACE_KEYWORDS:
+            if place in GENERIC_PLACE_KEYWORDS:
+                continue
+            if place in text:
+                risk_place_counts[place] += 1
+                # Save first 100 chars of post as sample (for context)
+                if place not in risk_place_samples:
+                    sample = post.text.strip().replace('\n', ' ')[:120]
+                    risk_place_samples[place] = sample
+
+    # Return top 7 with samples
+    result = []
+    ranked_places = risk_place_counts.most_common(limit)
+    for place, count in ranked_places:
+        result.append((place, count, risk_place_samples.get(place, '')))
+    return result
+
+
+def get_trend(current_score: int) -> str:
+    history = load_history()
+    if not history:
+        return "Первая запись статистики."
+    vals = list(history.values())
+    avg = sum(vals) / len(vals)
+    diff = current_score - avg
+    emoji = "⚠️" if diff > 5 else "✅" if diff < -5 else "ℹ️"
+    return f"{emoji} Тренд: {'+' if diff >= 0 else ''}{diff:.1f} к среднему (avg: {avg:.1f})"
+
+
+def local_day_start(now_local: datetime | None = None):
+    tz = ZoneInfo("Europe/Kyiv")
+    if now_local is None:
+        now_local = datetime.now(tz)
+    yesterday = now_local - timedelta(days=1)
+    start_local = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc), start_local
+
+
+@dataclass
+class PostStats:
+    id: int
+    date: datetime
+    views: int
+    text: str
+    channel: str = ''
+
+
+def build_daily_summaries(posts: list[PostStats], start_date, end_date) -> dict:
+    summaries = {}
+    current = start_date
+    while current <= end_date:
+        summaries[current.isoformat()] = {
+            'total_posts': 0,
+            'risk_posts': 0,
+            'hourly_risk': {f'{hour:02d}': 0 for hour in range(24)},
+        }
+        current += timedelta(days=1)
+
+    kyiv_tz = ZoneInfo('Europe/Kyiv')
+    for post in posts:
+        local_time = post.date.astimezone(kyiv_tz)
+        day_key = local_time.date().isoformat()
+        if day_key not in summaries:
+            continue
+        summary = summaries[day_key]
+        summary['total_posts'] += 1
+        if is_risk_post(post.text):
+            summary['risk_posts'] += 1
+            summary['hourly_risk'][f'{local_time.hour:02d}'] += 1
+    return summaries
+
+
+def build_location_history(posts: list[PostStats], start_date, end_date) -> dict:
+    posts_by_day = {}
+    kyiv_tz = ZoneInfo('Europe/Kyiv')
+    for post in posts:
+        day = post.date.astimezone(kyiv_tz).date()
+        if start_date <= day <= end_date:
+            posts_by_day.setdefault(day.isoformat(), []).append(post)
+
+    history = {}
+    current = start_date
+    while current <= end_date:
+        day_key = current.isoformat()
+        for place, count, _ in detect_risk_points(
+            posts_by_day.get(day_key, []),
+            limit=None,
+        ):
+            history.setdefault(place, {})[day_key] = count
+        current += timedelta(days=1)
+    return history
 
 
 def build_dashboard(
@@ -984,155 +1355,29 @@ def build_dashboard(
     weekly_hourly: dict[int, int],
     comparison: dict,
 ) -> str:
-    def display_number(value) -> str:
-        return f'{value:g}'.replace('.', ',')
-
-    # Calculate safety windows for tomorrow based on whether tomorrow is a weekend
-    tomorrow = report_date + timedelta(days=2) # report_date is yesterday, so tomorrow is +2 days
+    tomorrow = report_date + timedelta(days=2)
     safety = calculate_safety_windows(history_posts, tomorrow)
 
+    level, level_score = situation_level(event_counts)
+    trend_sign = "+" if comparison["last_14_avg"] > comparison["prev_14_avg"] else ""
+    if comparison["last_14_avg"] < comparison["prev_14_avg"]: trend_sign = "-"
+    trend_icon = "📈" if comparison["last_14_avg"] >= comparison["prev_14_avg"] else "📉"
+    
     lines = [
-        f'📊 **Статистика и прогноз: {title}**',
-        f'📅 Вчера ({report_date:%d.%m.%Y}), 00:00-24:00 по Киеву',
-        '',
-        f'📝 Всего сообщений в канале: {total_posts}',
-        f'⚠️ Сообщений о проверках: {risk_posts}',
-        '',
-        f'🛡 **Прогноз на завтра ({safety["day_type"]}, на базе 90 дней):**',
-        f'✅ Окна затишья: {safety["safe_windows"]}',
-        f'⛔ Высокий риск: {safety["high_risk"]}',
-        f'🌙 Комендантский час: 00:00-05:00 (любые перемещения опасны)',
+        f"📊 Аналитика: {title}",
+        f"📅 Дата: {report_date:%Y-%m-%d}",
+        f"🔴 Обстановка: {level}",
+        f"{trend_icon} Тренд: {trend_sign}{abs(comparison['last_14_avg'] - comparison['prev_14_avg']):.1f} к среднему (avg: {comparison['last_14_avg']:.1f})",
+        "",
+        f"📝 Сообщений: {total_posts}",
+        f"⚠️ Опасных сигналов: {risk_posts}",
+        "",
+        f"🛡 Прогноз на завтра ({safety['day_type']}):",
+        "✅ Окна затишья:\n" + safety['safe_windows'],
+        "⛔ Высокий риск:\n" + safety['high_risk'],
+        "🌙 Комендантский час: 00:00-05:00",
     ]
-
-    if event_counts:
-        lines.append('')
-        lines.append('**Что упоминали:**')
-        for label, count in event_counts.most_common():
-            lines.append(f'- {label}: {count}')
-        lines.append(
-            '_Одно сообщение может относиться к нескольким категориям._'
-        )
-
-    lines.extend(['', '**Сравнение простыми словами:**'])
-    previous_day = comparison.get('previous_day')
-    if previous_day is not None:
-        lines.append(f'- {format_change(risk_posts, previous_day, "позавчера")}')
-
-    weekday_average = comparison.get('weekday_average')
-    if weekday_average is not None:
-        weekday_labels = [
-            'в обычный понедельник',
-            'в обычный вторник',
-            'в обычную среду',
-            'в обычный четверг',
-            'в обычную пятницу',
-            'в обычную субботу',
-            'в обычное воскресенье',
-        ]
-        label = weekday_labels[report_date.weekday()]
-        weekday_change = format_change(risk_posts, weekday_average, label)
-        lines.append(
-            f'- По истории за 90 дней: {weekday_change[:1].lower()}{weekday_change[1:]}'
-        )
-
-    last_7 = comparison.get('last_7_total', 0)
-    previous_7 = comparison.get('previous_7_total', 0)
-    lines.append(f'- За последние 7 дней: {last_7}.')
-    if previous_7 is not None:
-        lines.append(f'- {format_change(last_7, previous_7, "за предыдущие 7 дней")}')
-
-    workday_average = comparison.get('workday_average')
-    weekend_average = comparison.get('weekend_average')
-    if workday_average is not None and weekend_average is not None:
-        lower_average = min(workday_average, weekend_average)
-        if lower_average:
-            difference = round(
-                abs(workday_average - weekend_average) / lower_average * 100
-            )
-            higher = 'в будни' if workday_average >= weekend_average else 'в выходные'
-            lines.append(
-                f'- По истории за 90 дней: в будни в среднем '
-                f'{display_number(workday_average)} сообщения в день, '
-                f'в выходные {display_number(weekend_average)}; '
-                f'{higher} активность выше '
-                f'примерно на {difference}%.'
-            )
-        elif workday_average == 0 and weekend_average > 0:
-            lines.append(
-                f'- По истории за 90 дней: в будни упоминаний не было, '
-                f'в выходные в среднем {display_number(weekend_average)} в день.'
-            )
-        elif weekend_average == 0 and workday_average > 0:
-            lines.append(
-                f'- По истории за 90 дней: в выходные упоминаний не было, '
-                f'в будни в среднем {display_number(workday_average)} в день.'
-            )
-        elif workday_average == 0 and weekend_average == 0:
-            lines.append(
-                '- По истории за 90 дней: упоминаний не было '
-                'ни в будни, ни в выходные.'
-            )
-
-    last_14_average = comparison.get('last_14_average')
-    previous_14_average = comparison.get('previous_14_average')
-    if last_14_average is not None and previous_14_average is not None:
-        if previous_14_average:
-            change_percent = round(
-                abs(last_14_average - previous_14_average)
-                / previous_14_average
-                * 100
-            )
-            if last_14_average > previous_14_average:
-                direction = 'выросла'
-            elif last_14_average < previous_14_average:
-                direction = 'снизилась'
-            else:
-                direction = 'не изменилась'
-            lines.append(
-                f'- Долгосрочно: средняя дневная активность {direction} '
-                f'на {change_percent}%: {display_number(last_14_average)} '
-                f'за последние 14 дней против '
-                f'{display_number(previous_14_average)} за предыдущие 14.'
-            )
-        elif last_14_average > 0:
-            lines.append(
-                f'- Долгосрочно: за предыдущие 14 дней упоминаний не было; '
-                f'за последние 14 дней в среднем '
-                f'{display_number(last_14_average)} в день.'
-            )
-        else:
-            lines.append(
-                '- Долгосрочно: упоминаний не было ни за последние, '
-                'ни за предыдущие 14 дней.'
-            )
-
-    lines.extend([
-        '',
-        '**Активность по часам за предыдущий день:**',
-        format_daily_hour_chart(hourly_risk),
-    ])
-    if any(weekly_hourly.values()):
-        lines.extend(['', '**Пиковые часы за последние 7 дней:**'])
-        weekly_peak = sorted(
-            (
-                (hour, count)
-                for hour, count in weekly_hourly.items()
-                if count > 0
-            ),
-            key=lambda item: -item[1],
-        )[:3]
-        peak_count = weekly_peak[0][1]
-        for hour, count in weekly_peak:
-            lines.append(
-                f'- {hour:02d}:00-{hour + 1:02d}:00 '
-                f'{format_hour_bar(count, peak_count, width=12)} {count}'
-            )
-    lines.extend([
-        '',
-        '💡 Это статистика публичных упоминаний, возможны неполные данные.',
-    ])
-    return '\n'.join(lines)
-
+    return "\n".join(lines)
 
 def situation_level(event_counts: Counter) -> tuple[str, int]:
     score = event_counts['тцк/военные'] * 3 + event_counts['полиция/копы'] * 2 + event_counts['блокировка'] * 4
