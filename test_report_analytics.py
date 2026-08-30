@@ -744,7 +744,7 @@ class IsRiskPostTests(unittest.TestCase):
     def test_actor_without_action_or_transport_is_not_risk(self):
         from send_channel_report import is_risk_post
         self.assertFalse(is_risk_post("Полиция проехала мимо"))
-        self.assertFalse(is_risk_post("ТЦКшники пьют кофе"))
+        self.assertFalse(is_risk_post("ТЦКшники проехали мимо"))
         
     def test_actor_and_action_is_risk(self):
         from send_channel_report import is_risk_post
