@@ -68,13 +68,21 @@ EVENT_PATTERNS = {
 
 # Patterns that signal "document check" risk (TSCH/military/police stops).
 # When a post mentions a place + one of these → it's a risk point.
-RISK_EVENT_PATTERNS = [
-    'тцк', 'военком', 'военные', 'повестк', 'вручают', 'выписывают', 'раздают',
-    'проверка', 'проверяют', 'документ', 'паспорт', 'призыв',
-    'копы', 'синие', 'полиция', 'патруль', 'наряд',
-    'блокпост', 'стоп', 'окружили', 'вяжут', 'прессуют', 'задерж',
-    'военкомат', 'рейд', 'облава', 'кирпич', 'жёлтый',
-]
+RISK_ACTORS = ['тцк', 'копы', 'синие', 'зеленые', 'черные', 'полиция', 'патруль', 'пидары', 'маслины', 'оливки', 'военкомат', 'военные']
+RISK_ACTIONS = ['проверка', 'проверяют', 'документ', 'паспорт', 'стоят', 'тормозят', 'прессуют', 'шмонают', 'пишут', 'остановили', 'блокпост', 'вяжут', 'задерж', 'катаются', 'поехали', 'ходят']
+RISK_TRANSPORT = ['вито', 'бус', 'спринтер', 'ланос', 'авео', 'приус', 'машина']
+STRONG_MARKERS = ['повестк', 'облава', 'рейд', 'вручают', 'выписывают']
+
+def is_risk_post(text: str) -> bool:
+    lower_text = text.lower()
+    if any(marker in lower_text for marker in STRONG_MARKERS):
+        return True
+    has_actor = any(actor in lower_text for actor in RISK_ACTORS)
+    has_action = any(action in lower_text for action in RISK_ACTIONS)
+    has_transport = any(transport in lower_text for transport in RISK_TRANSPORT)
+    if has_actor and (has_action or has_transport):
+        return True
+    return False
 
 # Additional place keywords specifically for risk points (districts, intersections).
 RISK_PLACE_KEYWORDS = PLACE_KEYWORDS + [
@@ -436,7 +444,7 @@ def build_novelty_posts(posts: list[PostStats]) -> list[NoveltyPost]:
         locations = extract_contextual_locations(post.text)
         lowered = post.text.lower()
         event_types = []
-        if any(pattern in lowered for pattern in RISK_EVENT_PATTERNS):
+        if is_risk_post(lowered):
             for label, patterns in EVENT_PATTERNS.items():
                 if any(pattern in lowered for pattern in patterns):
                     event_types.append(label)
@@ -628,7 +636,7 @@ def analyze_time_patterns(posts: list, days: int = 7) -> dict:
         all_hour_counts[hour] += 1
 
         text = post.text.lower()
-        if any(p in text for p in RISK_EVENT_PATTERNS):
+        if is_risk_post(text):
             risk_hour_counts[hour] += 1
 
     # Find peak hours (top 3 by risk count)
@@ -710,7 +718,7 @@ def detect_risk_points(posts: list, limit: int | None = 7) -> list:
     for post in posts:
         text = post.text.lower()
         # Check if post mentions ANY risk event
-        has_risk = any(p in text for p in RISK_EVENT_PATTERNS)
+        has_risk = is_risk_post(text)
         if not has_risk:
             continue
 
@@ -791,7 +799,7 @@ def build_daily_summaries(posts: list[PostStats], start_date, end_date) -> dict:
             continue
         summary = summaries[day_key]
         summary['total_posts'] += 1
-        if any(pattern in post.text.lower() for pattern in RISK_EVENT_PATTERNS):
+        if is_risk_post(post.text):
             summary['risk_posts'] += 1
             summary['hourly_risk'][f'{local_time.hour:02d}'] += 1
     return summaries
@@ -1090,7 +1098,7 @@ async def main(preview: bool = False):
             if msg.date >= start_utc:
                 posts.append(post_obj)
                 lowered = text.lower()
-                if any(pattern in lowered for pattern in RISK_EVENT_PATTERNS):
+                if is_risk_post(lowered):
                     for label, patterns in EVENT_PATTERNS.items():
                         if any(pattern in lowered for pattern in patterns):
                             event_counts[label] += 1

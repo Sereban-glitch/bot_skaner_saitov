@@ -174,7 +174,7 @@ class ReportAnalyticsTests(unittest.TestCase):
                 1,
                 datetime.now(timezone.utc),
                 0,
-                "Пески возле АТБ полиция. Пески за АТБ снова ТЦК.",
+                "Пески возле АТБ полиция стоят. Пески за АТБ снова ТЦК проверяют.",
             )
         ]
 
@@ -259,7 +259,7 @@ class ReportAnalyticsTests(unittest.TestCase):
     def test_different_atb_contexts_are_separate_risk_points(self):
         posts = [
             PostStats(1, datetime.now(timezone.utc), 0, "Пески, за АТБ стоят ТЦК"),
-            PostStats(2, datetime.now(timezone.utc), 0, "Бабурка, возле АТБ полиция"),
+            PostStats(2, datetime.now(timezone.utc), 0, "Бабурка, возле АТБ полиция стоят"),
         ]
 
         points = detect_risk_points(posts)
@@ -452,7 +452,7 @@ class ReportAnalyticsTests(unittest.TestCase):
                 2,
                 datetime(2026, 8, 27, 9, 0, tzinfo=timezone.utc),
                 0,
-                "Пески, возле АТБ полиция",
+                "Пески, возле АТБ полиция стоят",
             ),
         ]
 
@@ -730,3 +730,24 @@ class ReportDeliveryTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class IsRiskPostTests(unittest.TestCase):
+    def test_strong_marker_alone_is_risk(self):
+        from send_channel_report import is_risk_post
+        self.assertTrue(is_risk_post("Осторожно облава на песках"))
+        self.assertTrue(is_risk_post("Вручают повестки возле АТБ"))
+
+    def test_actor_without_action_or_transport_is_not_risk(self):
+        from send_channel_report import is_risk_post
+        self.assertFalse(is_risk_post("Полиция проехала мимо"))
+        self.assertFalse(is_risk_post("ТЦКшники пьют кофе"))
+        
+    def test_actor_and_action_is_risk(self):
+        from send_channel_report import is_risk_post
+        self.assertTrue(is_risk_post("полиция проверяют документы"))
+        self.assertTrue(is_risk_post("ТЦК стоят на кольце"))
+
+    def test_actor_and_transport_is_risk(self):
+        from send_channel_report import is_risk_post
+        self.assertTrue(is_risk_post("Зеленые на бусе"))
+        self.assertTrue(is_risk_post("Черные приехали на ланосе"))
