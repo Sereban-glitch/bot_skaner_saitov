@@ -7,7 +7,7 @@ import argparse
 import os
 import re
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -669,29 +669,21 @@ def update_risk_map(current_risk_places: Counter, date_str: str | None = None):
 
 
 def get_risk_patterns(risk_map: dict, min_days: int = 3):
-    """Find places that appear on >=min_days in last 7 days.
-    Returns list of tuples: [(place, days_count, total_mentions, last_date, avg_per_day), ...]
-    Sorted by days_count DESC, then total_mentions DESC.
-    """
     patterns = []
-    today = datetime.now().strftime('%Y-%m-%d')
-    yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-
-    for place, history in risk_map.items():
-        days_count = len(history)
-        total = sum(history.values())
-        if days_count < min_days:
-            continue
-        # Last seen date
-        last_date = max(history.keys())
-        # Is it active today or yesterday?
-        is_active_recently = last_date >= yesterday
-        # Average per active day
-        avg = total / days_count if days_count > 0 else 0
-        patterns.append((place, days_count, total, last_date, avg, is_active_recently))
-
-    # Sort: by days_count DESC, then total DESC
-    patterns.sort(key=lambda x: (-x[1], -x[2]))
+    for place, days_data in risk_map.items():
+        days_count = len(days_data)
+        if days_count >= min_days:
+            total = sum(d["count"] for d in days_data.values())
+            verified = any(d["verified"] for d in days_data.values())
+            last_seen = max(days_data.keys())
+            patterns.append({
+                "place": place,
+                "days_count": days_count,
+                "total_mentions": total,
+                "last_seen": last_seen,
+                "verified": verified
+            })
+    patterns.sort(key=lambda x: (x["days_count"], x["total_mentions"]), reverse=True)
     return patterns
 
 
@@ -788,18 +780,10 @@ def get_hotspots(map_data: dict):
 
 
 def detect_risk_points(posts: list, limit: int | None = 7) -> list:
-    """Detect places mentioned in posts that ALSO mention risk events
-    (TSCH, military, police, document checks, raids).
-
-    Returns list of tuples: [(place, count, sample_text), ...]
-    Sorted by count descending, top 7.
-    """
-    risk_place_counts = Counter()
-    risk_place_samples = {}
+    risk_place_posts = defaultdict(list)
 
     for post in posts:
         text = post.text.lower()
-        # Check if post mentions ANY risk event
         has_risk = is_risk_post(text)
         if not has_risk:
             continue
@@ -807,29 +791,29 @@ def detect_risk_points(posts: list, limit: int | None = 7) -> list:
         contextual_locations = extract_contextual_locations(post.text)
         if contextual_locations:
             for place in contextual_locations:
-                risk_place_counts[place] += 1
-                risk_place_samples.setdefault(
-                    place,
-                    post.text.strip().replace('\n', ' ')[:240],
-                )
+                risk_place_posts[place].append(post)
             continue
 
-        # Find which risk place is mentioned
         for place in RISK_PLACE_KEYWORDS:
             if place in GENERIC_PLACE_KEYWORDS:
                 continue
             if place in text:
-                risk_place_counts[place] += 1
-                # Save first 100 chars of post as sample (for context)
-                if place not in risk_place_samples:
-                    sample = post.text.strip().replace('\n', ' ')[:120]
-                    risk_place_samples[place] = sample
+                risk_place_posts[place].append(post)
 
-    # Return top 7 with samples
     result = []
-    ranked_places = risk_place_counts.most_common(limit)
-    for place, count in ranked_places:
-        result.append((place, count, risk_place_samples.get(place, '')))
+    for place, place_posts in risk_place_posts.items():
+        unique_texts = set()
+        dedup = []
+        for p in place_posts:
+            if p.text not in unique_texts:
+                unique_texts.add(p.text)
+                dedup.append(p)
+        if dedup:
+            result.append((place, len(dedup), {"posts": dedup}))
+            
+    result.sort(key=lambda x: x[1], reverse=True)
+    if limit:
+        result = result[:limit]
     return result
 
 
@@ -889,24 +873,50 @@ def build_daily_summaries(posts: list[PostStats], start_date, end_date) -> dict:
 
 
 def build_location_history(posts: list[PostStats], start_date, end_date) -> dict:
-    posts_by_day = {}
-    kyiv_tz = ZoneInfo('Europe/Kyiv')
+    history = defaultdict(lambda: defaultdict(list))
     for post in posts:
-        day = post.date.astimezone(kyiv_tz).date()
-        if start_date <= day <= end_date:
-            posts_by_day.setdefault(day.isoformat(), []).append(post)
-
-    history = {}
-    current = start_date
-    while current <= end_date:
-        day_key = current.isoformat()
-        for place, count, _ in detect_risk_points(
-            posts_by_day.get(day_key, []),
-            limit=None,
-        ):
-            history.setdefault(place, {})[day_key] = count
-        current += timedelta(days=1)
-    return history
+        post_date = post.date.astimezone(KYIV_TZ).date()
+        if start_date <= post_date <= end_date:
+            text = post.text.lower()
+            if not is_risk_post(text):
+                continue
+            
+            locations = extract_contextual_locations(post.text)
+            if not locations:
+                for place in RISK_PLACE_KEYWORDS:
+                    if place in GENERIC_PLACE_KEYWORDS: continue
+                    if place in text:
+                        locations.append(place)
+            
+            for loc in set(locations):
+                history[loc][post_date.isoformat()].append(post)
+                
+    result = defaultdict(dict)
+    for loc, days in history.items():
+        for date_str, loc_posts in days.items():
+            unique_texts = set()
+            dedup_posts = []
+            for p in loc_posts:
+                if p.text not in unique_texts:
+                    unique_texts.add(p.text)
+                    dedup_posts.append(p)
+            
+            count = len(dedup_posts)
+            verified = False
+            sources = {p.channel for p in dedup_posts if p.channel}
+            if len(sources) >= 2:
+                dedup_posts.sort(key=lambda x: x.date)
+                for i in range(len(dedup_posts)):
+                    for j in range(i+1, len(dedup_posts)):
+                        p1, p2 = dedup_posts[i], dedup_posts[j]
+                        if p1.source != p2.source and abs((p1.date - p2.date).total_seconds()) <= 7200:
+                            verified = True
+                            break
+                    if verified: break
+            
+            result[loc][date_str] = {"count": count, "verified": verified}
+            
+    return dict(result)
 
 
 def build_detail_report(
@@ -971,7 +981,12 @@ def build_detail_report(
     if slang_text:
         lines.append(slang_text)
 
-    return "\n".join(lines).strip()
+
+    text = "\n".join(lines).strip()
+    if telegram_text_units(text) > 4096:
+        return truncate_telegram_text(text, 4000)
+    return text
+
 
 def format_unusual_signals(signals, reason_codes) -> str:
     if not signals:
@@ -1420,27 +1435,59 @@ async def main(preview: bool = False):
     history_start_date = report_date - timedelta(days=90)
     history_start_utc = (local_report_day - timedelta(days=90)).astimezone(timezone.utc)
 
+
     try:
-        entity = await client.get_entity(channel_ref)
+        targets = []
+        if env('CHANNEL_REPORT_TARGET'):
+            targets.append(env('CHANNEL_REPORT_TARGET'))
+        if env('CHANNEL_REPORT_TARGET_2'):
+            targets.append(env('CHANNEL_REPORT_TARGET_2'))
+            
         posts = []
         history_posts = []
         event_counts = Counter()
+        
+        for target in targets:
+            try:
+                entity = await client.get_entity(target)
+            except Exception as e:
+                print(f"Failed to get entity {target}: {e}")
+                continue
+                
+            reply_to = None
+            if getattr(entity, 'forum', False):
+                from telethon.tl.functions.messages import GetForumTopicsRequest
+                topics = await client(GetForumTopicsRequest(
+                    peer=entity,
+                    offset_date=None,
+                    offset_id=0,
+                    offset_topic=0,
+                    limit=100
+                ))
+                for topic in topics.topics:
+                    title = getattr(topic, 'title', '')
+                    if "Ситуация" in title or "ситуация" in title.lower():
+                        reply_to = topic.id
+                        break
+                        
+            # Use channel title or username as source identifier
+            source_name = getattr(entity, 'title', target)
 
-        async for msg in client.iter_messages(entity, offset_date=end_utc):
-            if msg.date < history_start_utc:
-                break
-            text = strip_channel_boilerplate(msg.message or '')
-            post_obj = PostStats(msg.id, msg.date, getattr(msg, 'views', 0) or 0, text)
-            history_posts.append(post_obj)
+            async for msg in client.iter_messages(entity, offset_date=end_utc, reply_to=reply_to):
+                if msg.date < history_start_utc:
+                    break
+                text = strip_channel_boilerplate(msg.message or '')
+                post_obj = PostStats(msg.id, msg.date, getattr(msg, 'views', 0) or 0, text, channel=source_name)
+                history_posts.append(post_obj)
+                if len(history_posts) % 1000 == 0: print(f"Fetched {len(history_posts)} messages...")
 
-            if msg.date >= start_utc:
-                posts.append(post_obj)
-                lowered = text.lower()
-                if is_risk_post(lowered):
-                    for label, patterns in EVENT_PATTERNS.items():
-                        if any(pattern in lowered for pattern in patterns):
-                            event_counts[label] += 1
-
+                if msg.date >= start_utc:
+                    posts.append(post_obj)
+                    lowered = text.lower()
+                    if is_risk_post(lowered):
+                        for label, patterns in EVENT_PATTERNS.items():
+                            if any(pattern in lowered for pattern in patterns):
+                                event_counts[label] += 1
         daily_summaries = build_daily_summaries(
             history_posts,
             history_start_date,

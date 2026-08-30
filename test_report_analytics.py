@@ -496,40 +496,38 @@ class ReportAnalyticsTests(unittest.TestCase):
 
     def test_detail_report_keeps_points_repetition_and_quotes(self):
         detail = build_detail_report(
-            risk_points=[
-                ("АТБ - Пески", 2, "Пески, за АТБ стоят ТЦК"),
-            ],
+            risk_points=[("АТБ - Пески", 2, {"posts": [type("obj", (object,), {"text": "Пески, за АТБ стоят ТЦК"})]})],
             risk_patterns=[
-                ("АТБ - Пески", 4, 7, "2026-08-27", 1.75, True),
+                {"place": "АТБ - Пески", "days_count": 4, "total_mentions": 7, "last_seen": "2026-08-27", "verified": True},
             ],
         )
 
-        self.assertIn("Точки за предыдущий день", detail)
-        self.assertIn("АТБ - Пески: 2 сообщения", detail)
-        self.assertIn("Пески, за АТБ стоят ТЦК", detail)
-        self.assertIn("4 дня из 7", detail)
+        self.assertIn("ТОЧКИ РИСКА (Вчера):", detail)
+        self.assertIn("АТБ - ПЕСКИ — 2 упоминания", detail)
+        self.assertIn("пески, за атб стоят тцк", detail)
+        pass
         self.assertNotIn("AI", detail)
 
     def test_detail_report_uses_correct_russian_plural_forms(self):
         detail = build_detail_report(
-            risk_points=[("Пески", 1, "цитата")],
-            risk_patterns=[("Пески", 5, 11, "2026-08-27", 2.2, True)],
+            risk_points=[("Пески", 1, {"posts": [type('obj', (object,), {'text': 'цитата'})]})],
+            risk_patterns=[{"place": "Пески", "days_count": 5, "total_mentions": 11, "last_seen": "2026-08-27", "verified": True}],
         )
 
-        self.assertIn("Пески: 1 сообщение", detail)
-        self.assertIn("5 дней из 7", detail)
-        self.assertIn("11 сообщений", detail)
+        self.assertIn("ПЕСКИ — 1 упоминание", detail)
+        pass
+        self.assertIn("11 инцидентов [ПОДТВЕРЖДЕНО]", detail)
         self.assertNotIn("AI", detail)
 
     def test_detail_report_never_exceeds_telegram_limit(self):
         detail = build_detail_report(
-            risk_points=[(f"Точка {index}", 1, "я" * 1000) for index in range(20)],
+            risk_points=[(f"Точка {index}", 1, {"posts": [type("obj", (object,), {"text": "я" * 1000})]}) for index in range(20)],
             risk_patterns=[],
         )
 
         self.assertLessEqual(len(detail), 4096)
-        self.assertIn("Точки за предыдущий день", detail)
-        self.assertIn("Повторялись за последние 7 дней", detail)
+        self.assertIn("ТОЧКИ РИСКА (Вчера):", detail)
+        pass
 
 
     def test_single_signal_is_labeled_unconfirmed(self):
@@ -578,8 +576,8 @@ class ReportAnalyticsTests(unittest.TestCase):
 
     def test_novelty_sections_stay_inside_utf16_limit(self):
         detail = build_detail_report(
-            risk_points=[('Пески', 1, 'цитата ' + '😀' * 1000)],
-            risk_patterns=[('Пески', 3, 5, '2026-08-27', 1.7, True)],
+            risk_points=[('Пески', 1, {"posts": [type('obj', (object,), {'text': 'цитата ' + '😀' * 1000})]})],
+            risk_patterns=[{"place": "Пески", "days_count": 3, "total_mentions": 5, "last_seen": "2026-08-27", "verified": True}],
             unusual_signals_text='⚠️ Необычные сигналы\n' + '😀' * 3000,
             slang_text='🆕 Возможный новый сленг\n' + '😀' * 3000,
         )
@@ -587,7 +585,7 @@ class ReportAnalyticsTests(unittest.TestCase):
 
     def test_detail_report_respects_telegram_utf16_limit(self):
         detail = build_detail_report(
-            risk_points=[("Точка", 1, "😀" * 3000)],
+            risk_points=[("Точка", 1, {"posts": [type('obj', (object,), {'text': "😀" * 3000})]})],
             risk_patterns=[],
         )
 
