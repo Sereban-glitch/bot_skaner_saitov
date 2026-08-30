@@ -751,3 +751,39 @@ class IsRiskPostTests(unittest.TestCase):
         from send_channel_report import is_risk_post
         self.assertTrue(is_risk_post("Зеленые на бусе"))
         self.assertTrue(is_risk_post("Черные приехали на ланосе"))
+
+class SafetyWindowsTests(unittest.TestCase):
+    def test_calculate_safety_windows_ignores_wrong_day_type(self):
+        from send_channel_report import calculate_safety_windows
+        # Build 10 posts on a Monday (weekday), 1 on a Saturday (weekend)
+        mon_date = datetime(2026, 8, 24, tzinfo=timezone.utc)
+        sat_date = datetime(2026, 8, 29, tzinfo=timezone.utc)
+        
+        posts = [PostStats(i, mon_date.replace(hour=8), 0, "ТЦК стоят") for i in range(10)]
+        posts.append(PostStats(11, sat_date.replace(hour=14), 0, "полиция стоят"))
+        
+        # Target = Tuesday (weekday), should see the 10 posts at 08:00
+        res = calculate_safety_windows(posts, date(2026, 8, 25))
+        self.assertEqual(res["day_type"], "Будни")
+        self.assertEqual(res["high_risk"], "11:00-12:00")
+        
+        # Target = Sunday (weekend), should see only the 1 post at 14:00
+        res2 = calculate_safety_windows(posts, date(2026, 8, 30))
+        self.assertEqual(res2["day_type"], "Выходные")
+        self.assertEqual(res2["high_risk"], "17:00-18:00")
+        
+    def test_safety_windows_exclude_curfew(self):
+        from send_channel_report import calculate_safety_windows
+        # Create a day with 0 incidents. Curfew (0-4) should be excluded from safe windows.
+        mon_date = datetime(2026, 8, 24, tzinfo=timezone.utc)
+        posts = [PostStats(1, mon_date.replace(hour=12), 0, "No danger here")]
+        
+        res = calculate_safety_windows(posts, date(2026, 8, 25))
+        # 05:00-24:00 is 19 hours, skipping 00:00-05:00
+        self.assertEqual(res["safe_windows"], "05:00-24:00")
+
+    def test_insufficient_history(self):
+        from send_channel_report import calculate_safety_windows
+        res = calculate_safety_windows([], date(2026, 8, 25))
+        self.assertEqual(res["safe_windows"], "Нет данных")
+        self.assertEqual(res["high_risk"], "Нет данных")

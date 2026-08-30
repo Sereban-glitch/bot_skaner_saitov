@@ -247,6 +247,88 @@ async def ask_ai_for_signal_reasons(
     return {}
 
 
+
+def is_weekend(d: datetime.date) -> bool:
+    return d.weekday() >= 5
+
+def format_hour_range(start_hour: int, end_hour: int) -> str:
+    return f"{start_hour:02d}:00-{end_hour:02d}:00"
+
+def calculate_safety_windows(history_posts: list[PostStats], target_date: datetime.date) -> dict:
+    kyiv_tz = ZoneInfo('Europe/Kyiv')
+    target_is_weekend = is_weekend(target_date)
+    
+    # Track days that match our target day type
+    matched_dates = set()
+    hourly_counts = {h: 0 for h in range(24)}
+    
+    for post in history_posts:
+        local_time = post.date.astimezone(kyiv_tz)
+        post_date = local_time.date()
+        
+        # Only consider posts from the same day type (weekday vs weekend)
+        if is_weekend(post_date) != target_is_weekend:
+            continue
+            
+        matched_dates.add(post_date)
+        
+        if is_risk_post(post.text):
+            hourly_counts[local_time.hour] += 1
+            
+    days_count = len(matched_dates)
+    if days_count == 0:
+        return {"safe_windows": "Нет данных", "high_risk": "Нет данных", "day_type": "Выходные" if target_is_weekend else "Будни"}
+        
+    avg_per_hour = {h: count / days_count for h in range(24) for h, count in hourly_counts.items()}
+    
+    # 1. High Risk Hours: top 4 hours where avg > 0.0
+    sorted_hours = sorted([(h, avg) for h, avg in avg_per_hour.items()], key=lambda x: x[1], reverse=True)
+    high_risk_hours = sorted([h for h, avg in sorted_hours[:4] if avg > 0.0])
+    
+    # Merge contiguous high risk hours
+    high_risk_ranges = []
+    if high_risk_hours:
+        start = high_risk_hours[0]
+        prev = start
+        for h in high_risk_hours[1:]:
+            if h == prev + 1:
+                prev = h
+            else:
+                high_risk_ranges.append(format_hour_range(start, prev + 1))
+                start = h
+                prev = h
+        high_risk_ranges.append(format_hour_range(start, prev + 1))
+        
+    high_risk_str = ", ".join(high_risk_ranges) if high_risk_ranges else "Не выявлен"
+
+    # 2. Safe Windows: avg < 0.2, at least 2 contiguous hours, STRICTLY excluding 0..4
+    curfew_hours = {0, 1, 2, 3, 4}
+    safe_hours = [h for h, avg in avg_per_hour.items() if avg < 0.2 and h not in curfew_hours]
+    
+    safe_ranges = []
+    if safe_hours:
+        safe_hours.sort()
+        start = safe_hours[0]
+        prev = start
+        for h in safe_hours[1:]:
+            if h == prev + 1:
+                prev = h
+            else:
+                if (prev - start + 1) >= 2:
+                    safe_ranges.append(format_hour_range(start, prev + 1))
+                start = h
+                prev = h
+        if (prev - start + 1) >= 2:
+            safe_ranges.append(format_hour_range(start, prev + 1))
+            
+    safe_windows_str = ", ".join(safe_ranges) if safe_ranges else "Нет четко выраженных окон"
+    
+    return {
+        "safe_windows": safe_windows_str,
+        "high_risk": high_risk_str,
+        "day_type": "Выходные" if target_is_weekend else "Будни"
+    }
+
 def strip_channel_boilerplate(text: str) -> str:
     lowered = text.lower()
     markers = (
