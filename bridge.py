@@ -547,7 +547,7 @@ async def analyze_with_ai(html_content: str) -> str:
             # IMPORTANT: proxy at :18080 is antigravity-claude-proxy (Anthropic API format)
             # NOT OpenAI. Use /v1/messages with top-level "system" field.
             payload = {
-                "model": "gemini-3.7-flash-tiered",
+                "model": os.environ.get("REPORT_AI_MODEL", "gemini-3.7-flash-tiered"),
                 "max_tokens": 4000,
                 "system": "Ты — профессиональный Telegram-редактор и аналитик. Твоя задача — делать крутые посты-выжимки, фильтровать агрессию, смещать акценты на суть прецедента. Тон нейтральный и объективный. ВСЕГДА включай номер дела отдельной строкой.",
                 "messages": [{"role": "user", "content": prompt}],
