@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import asyncio
 import aiohttp
 import contextlib
@@ -10,10 +11,12 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from telethon import TelegramClient, events
@@ -21,8 +24,6 @@ from telethon.errors import ChatWriteForbiddenError, FloodWaitError
 from telethon.tl.types import MessageEntityBotCommand, MessageMediaWebPage
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOCK_PATH = os.path.join(BASE_DIR, "bridge.lock")
-HEALTH_PATH = os.path.join(BASE_DIR, "bridge.health.json")
 PROCESSED_PATH = os.path.join(BASE_DIR, "processed_ids.json")
 
 def truncate_caption(caption: str | None, limit: int = 1024) -> str | None:
@@ -148,6 +149,78 @@ class Settings:
     rss_recent_limit: int
 
 
+@dataclass(frozen=True)
+class StatePaths:
+    directory: str
+    source: str
+    rss: str
+    health: str
+    lock: str
+
+    @classmethod
+    def from_directory(cls, directory: str) -> "StatePaths":
+        root = os.path.abspath(directory)
+        return cls(
+            directory=root,
+            source=os.path.join(root, "bridge.state.json"),
+            rss=os.path.join(root, "rss-state.json"),
+            health=os.path.join(root, "bridge.health.json"),
+            lock=os.path.join(root, "bridge.lock"),
+        )
+
+    @classmethod
+    def from_environment(cls) -> "StatePaths":
+        return cls.from_directory(env("BRIDGE_STATE_DIR", BASE_DIR))
+
+
+@dataclass(frozen=True)
+class OnceOptions:
+    seed_current: bool = False
+    force_reseed: bool = False
+    shadow: bool = False
+    max_source_items: int = 20
+    max_rss_items: int = 5
+    deadline_seconds: float = 780
+
+
+@dataclass
+class OnceResult:
+    source_inspected: int = 0
+    source_filtered: int = 0
+    source_selected: int = 0
+    source_sent: int = 0
+    rss_selected: int = 0
+    rss_sent: int = 0
+    notification_failures: int = 0
+
+    def counts(self) -> dict[str, int]:
+        return {
+            "source_inspected": self.source_inspected,
+            "source_filtered": self.source_filtered,
+            "source_selected": self.source_selected,
+            "source_sent": self.source_sent,
+            "rss_selected": self.rss_selected,
+            "rss_sent": self.rss_sent,
+            "notification_failures": self.notification_failures,
+        }
+
+
+class DurableStateError(RuntimeError):
+    pass
+
+
+class PrimarySendError(RuntimeError):
+    pass
+
+
+class RSSFeedError(RuntimeError):
+    pass
+
+
+class LockBusyError(RuntimeError):
+    pass
+
+
 def load_settings() -> Settings:
     load_dotenv()
     return Settings(
@@ -261,13 +334,24 @@ def load_state(path: str) -> dict[str, Any]:
 
 
 def save_state(path: str, payload: dict[str, Any]) -> None:
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle)
-    os.replace(tmp_path, path)
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_path)
 
 
 def utc_now() -> str:
@@ -275,18 +359,30 @@ def utc_now() -> str:
 
 
 @contextlib.contextmanager
-def single_instance(path: str):
-    handle = open(path, "w", encoding="utf-8")
+def single_instance(path: str, write_pid: bool = True, allow_missing: bool = False):
+    directory = os.path.dirname(path)
+    if directory and write_pid:
+        os.makedirs(directory, exist_ok=True)
+    if not write_pid and not os.path.exists(path):
+        if allow_missing:
+            yield
+            return
+        raise DurableStateError(f"shared lock does not exist: {path}")
+    mode = "a+" if write_pid else "r+"
+    handle = open(path, mode, encoding="utf-8")
     locked = False
     try:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
-            raise SystemExit(f"Bridge is already running or lock is busy: {path}") from exc
+            raise LockBusyError(f"Bridge is already running or lock is busy: {path}") from exc
         locked = True
-        handle.write(str(os.getpid()))
-        handle.truncate()
-        handle.flush()
+        if write_pid:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(str(os.getpid()))
+            handle.flush()
+            os.fsync(handle.fileno())
         yield
     finally:
         if locked:
@@ -451,7 +547,7 @@ async def analyze_with_ai(html_content: str) -> str:
             # IMPORTANT: proxy at :18080 is antigravity-claude-proxy (Anthropic API format)
             # NOT OpenAI. Use /v1/messages with top-level "system" field.
             payload = {
-                "model": "gemini-3.5-flash-low",
+                "model": "gemini-3.7-flash-tiered",
                 "max_tokens": 4000,
                 "system": "Ты — профессиональный Telegram-редактор и аналитик. Твоя задача — делать крутые посты-выжимки, фильтровать агрессию, смещать акценты на суть прецедента. Тон нейтральный и объективный. ВСЕГДА включай номер дела отдельной строкой.",
                 "messages": [{"role": "user", "content": prompt}],
@@ -469,6 +565,10 @@ async def analyze_with_ai(html_content: str) -> str:
                             res = block.get("text", "").strip()
                             break
                 if not res:
+                    return "FALLBACK"
+                # Защита от системных сообщений Antigravity
+                if "is no longer available" in res or "switch to Gemini" in res or "Antigravity" in res:
+                    print(f"API error injected in text: {res}", flush=True)
                     return "FALLBACK"
                 if "FALLBACK" in res.upper() and len(res) < 20:
                     return "FALLBACK"
@@ -527,30 +627,47 @@ async def build_rss_excerpt(description: str, content: str, link: str) -> str:
     return shorten(html_excerpt or excerpt, 650)
 
 
-async def parse_rss_items(feed_url: str) -> list[dict[str, str]]:
-    payload = await fetch_url_text(feed_url)
-    if not payload:
-        return []
+async def fetch_url_text_strict(url: str) -> str:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            url, headers={"User-Agent": "Mozilla/5.0 Codex Bridge"}, timeout=30
+        ) as response:
+            response.raise_for_status()
+            return await response.text()
+
+
+async def parse_rss_metadata_items(feed_url: str, fetcher: Any = None) -> list[dict[str, str]]:
+    fetch = fetcher or fetch_url_text_strict
+    try:
+        payload = await fetch(feed_url)
+    except RSSFeedError:
+        raise
+    except Exception as exc:
+        raise RSSFeedError(f"RSS fetch failed: {exc}") from exc
+    if not isinstance(payload, str) or not payload.strip():
+        raise RSSFeedError("RSS feed returned an empty response")
     try:
         root = ET.fromstring(payload.encode("utf-8"))
-    except Exception:
-        return []
+    except (ET.ParseError, UnicodeError) as exc:
+        raise RSSFeedError(f"malformed RSS XML: {exc}") from exc
     channel = root.find("channel")
     if channel is None:
-        return []
+        raise RSSFeedError("malformed RSS XML: channel is missing")
 
     items: list[dict[str, str]] = []
-    for item in channel.findall("item"):
+    for feed_order, item in enumerate(channel.findall("item")):
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
         guid = (item.findtext("guid") or "").strip()
+        published = (item.findtext("pubDate") or "").strip()
         description = strip_html(item.findtext("description"))
         content = ""
         for child in item:
             if child.tag.endswith("encoded"):
                 content = strip_html(child.text)
                 break
-        excerpt = await build_rss_excerpt(description, content, link)
+            if not published and child.tag.endswith("date"):
+                published = (child.text or "").strip()
         item_id = guid or link or title
         if not item_id or not link:
             continue
@@ -563,8 +680,20 @@ async def parse_rss_items(feed_url: str) -> list[dict[str, str]]:
                 "guid": guid,
                 "title": title,
                 "link": link,
-                "excerpt": excerpt,
+                "description": description,
+                "content": content,
+                "published": published,
+                "feed_order": str(feed_order),
             }
+        )
+    return items
+
+
+async def parse_rss_items(feed_url: str) -> list[dict[str, str]]:
+    items = await parse_rss_metadata_items(feed_url)
+    for item in items:
+        item["excerpt"] = await build_rss_excerpt(
+            item["description"], item["content"], item["link"]
         )
     return items
 
@@ -591,13 +720,503 @@ def item_keys(item: dict[str, str]) -> list[str]:
     return keys
 
 
-async def main() -> None:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Telegram MTProto bridge")
+    parser.add_argument("--once", action="store_true", help="run one safe catch-up")
+    parser.add_argument("--seed-current", action="store_true", help="seed current baselines")
+    parser.add_argument("--force-reseed", action="store_true", help="replace existing baselines")
+    parser.add_argument("--shadow", action="store_true", help="select and format without sends or state writes")
+    parser.add_argument("--max-source-items", type=int, default=20)
+    parser.add_argument("--max-rss-items", type=int, default=5)
+    parser.add_argument("--deadline-seconds", type=float, default=780)
+    args = parser.parse_args(argv)
+    if args.force_reseed and not args.seed_current:
+        parser.error("--force-reseed requires --seed-current")
+    if args.seed_current and args.shadow:
+        parser.error("--seed-current and --shadow cannot be combined")
+    if args.max_source_items < 1 or args.max_rss_items < 1 or args.deadline_seconds <= 0:
+        parser.error("item limits and deadline must be positive")
+    return args
+
+
+def _read_json_required(path: str, label: str) -> dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except FileNotFoundError as exc:
+        raise DurableStateError(f"missing {label}: {path}") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DurableStateError(f"malformed {label}: {path}") from exc
+    if not isinstance(payload, dict):
+        raise DurableStateError(f"malformed {label}: expected JSON object")
+    return payload
+
+
+def _source_state(settings: Settings, path: str) -> dict[str, Any]:
+    state = _read_json_required(path, "source baseline")
+    expected = (1, settings.source_chat, settings.target_channel)
+    actual = (state.get("schema"), state.get("source_chat"), state.get("target_channel"))
+    cursor = state.get("last_source_message_id")
+    if actual != expected or not isinstance(cursor, int) or cursor < 0:
+        raise DurableStateError("source baseline is malformed or does not match configuration")
+    return state
+
+
+def _rss_state(settings: Settings, path: str) -> dict[str, Any]:
+    state = _read_json_required(path, "RSS baseline")
+    expected = (1, settings.rss_feed_url, settings.rss_target_channel)
+    actual = (state.get("schema"), state.get("feed_url"), state.get("target_channel"))
+    recent_ids = state.get("recent_ids")
+    if (
+        actual != expected
+        or not isinstance(state.get("last_seen_id"), str)
+        or not state.get("last_seen_id", "").strip()
+        or not isinstance(recent_ids, list)
+        or not recent_ids
+        or any(not isinstance(value, str) or not value.strip() for value in recent_ids)
+    ):
+        raise DurableStateError("RSS baseline is malformed or does not match configuration")
+    return state
+
+
+def _source_payload(settings: Settings, cursor: int) -> dict[str, Any]:
+    return {
+        "schema": 1,
+        "source_chat": settings.source_chat,
+        "target_channel": settings.target_channel,
+        "last_source_message_id": cursor,
+    }
+
+
+def _rss_payload(settings: Settings, last_seen_id: str, recent_ids: list[str]) -> dict[str, Any]:
+    return {
+        "schema": 1,
+        "feed_url": settings.rss_feed_url,
+        "target_channel": settings.rss_target_channel,
+        "last_seen_id": last_seen_id,
+        "recent_ids": recent_ids,
+    }
+
+
+def load_or_migrate_source_state(settings: Settings, paths: StatePaths) -> dict[str, Any]:
+    if os.path.exists(paths.source):
+        return _source_state(settings, paths.source)
+    health = _read_json_required(paths.health, "source baseline; run --seed-current")
+    expected = (settings.source_chat, settings.target_channel)
+    actual = (health.get("source_chat"), health.get("target_channel"))
+    cursor = health.get("last_source_message_id")
+    if actual != expected or not isinstance(cursor, int) or cursor < 0:
+        raise DurableStateError("no valid matching source cursor; run --seed-current explicitly")
+    state = _source_payload(settings, cursor)
+    save_state(paths.source, state)
+    return state
+
+
+async def publish_primary(
+    sender: Any,
+    *,
+    checkpoint: Any,
+    notify: Any = None,
+    label: str = "primary",
+) -> Any:
+    result = await sender()
+    if result is None:
+        raise PrimarySendError(f"{label} send returned no result")
+    checkpoint()
+    if notify is not None:
+        with contextlib.suppress(Exception):
+            await notify()
+    return result
+
+
+def _snapshot_file(path: str) -> bytes | None:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+
+
+def _restore_file(path: str, snapshot: bytes | None) -> None:
+    if snapshot is None:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+        return
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.restore.", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(snapshot)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_path)
+
+
+def _write_seed_transaction(
+    paths: StatePaths,
+    source_payload: dict[str, Any],
+    rss_payload: dict[str, Any] | None,
+    writer: Any,
+) -> None:
+    snapshots = {paths.source: _snapshot_file(paths.source), paths.rss: _snapshot_file(paths.rss)}
+    try:
+        writer(paths.source, source_payload)
+        if rss_payload is not None:
+            writer(paths.rss, rss_payload)
+    except Exception:
+        _restore_file(paths.source, snapshots[paths.source])
+        _restore_file(paths.rss, snapshots[paths.rss])
+        raise
+
+
+def _health_payload(
+    status: str,
+    result: OnceResult,
+    started_at: str,
+    error: str = "",
+    finished: bool = False,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": status,
+        "pid": os.getpid(),
+        "started_at": started_at,
+        "updated_at": utc_now(),
+        "counts": result.counts(),
+        "error": error,
+    }
+    if finished:
+        payload["finished_at"] = utc_now()
+    return payload
+
+
+async def _default_rss_post_builder(item: dict[str, str]) -> str:
+    enriched = dict(item)
+    enriched["excerpt"] = await build_rss_excerpt(
+        item.get("description", ""), item.get("content", ""), item["link"]
+    )
+    return format_rss_post(enriched)
+
+
+async def _collect_source_messages(client: Any, entity: Any, cursor: int, maximum: int) -> list[Any]:
+    messages: list[Any] = []
+    trailing_group = None
+    async for message in client.iter_messages(entity, min_id=cursor, reverse=True):
+        grouped_id = getattr(message, "grouped_id", None)
+        if len(messages) >= maximum and not (trailing_group and grouped_id == trailing_group):
+            break
+        messages.append(message)
+        if len(messages) == maximum:
+            trailing_group = grouped_id
+    return messages
+
+
+def _message_batches(messages: list[Any]) -> list[list[Any]]:
+    batches: list[list[Any]] = []
+    index = 0
+    while index < len(messages):
+        first = messages[index]
+        grouped_id = getattr(first, "grouped_id", None)
+        if not grouped_id:
+            batches.append([first])
+            index += 1
+            continue
+        end = index + 1
+        while end < len(messages) and getattr(messages[end], "grouped_id", None) == grouped_id:
+            end += 1
+        batches.append(messages[index:end])
+        index = end
+    return batches
+
+
+def _select_unseen_rss(
+    items: list[dict[str, str]], seen: set[str], maximum: int
+) -> list[dict[str, str]]:
+    unseen = [item for item in items if not any(key in seen for key in item_keys(item))]
+    dated: list[tuple[float, int, dict[str, str]]] = []
+    for index, item in enumerate(unseen):
+        try:
+            timestamp = parsedate_to_datetime(item.get("published", "")).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            break
+        dated.append((timestamp, index, item))
+    if len(dated) == len(unseen):
+        unseen = [item for _, _, item in sorted(dated, key=lambda value: (value[0], value[1]))]
+    else:
+        unseen.reverse()
+    return unseen[:maximum]
+
+
+async def _notify_best_effort(
+    client: Any,
+    settings: Settings,
+    chats: tuple[str, ...],
+    text: str,
+    result: OnceResult,
+    output: Any,
+) -> None:
+    recipients = [chat for chat in chats if chat]
+    if not recipients and settings.notify_chat:
+        recipients = [settings.notify_chat]
+    for chat in recipients:
+        try:
+            sent = await client.send_message(chat, text)
+            if sent is None:
+                raise RuntimeError("send returned no result")
+        except Exception as exc:
+            result.notification_failures += 1
+            output(f"notification failed destination={chat} error={exc}")
+
+
+async def _seed_current(
+    settings: Settings,
+    client: Any,
+    options: OnceOptions,
+    paths: StatePaths,
+    rss_items_loader: Any,
+    state_writer: Any,
+) -> OnceResult:
+    if not options.force_reseed and (
+        os.path.exists(paths.source)
+        or (settings.rss_feed_url and settings.rss_target_channel and os.path.exists(paths.rss))
+    ):
+        raise DurableStateError("baseline already exists; use --force-reseed to replace it")
+
+    await client.start()
+    entity = await client.get_entity(normalize_chat_id(settings.source_chat) or settings.source_chat)
+    newest_id = None
+    async for message in client.iter_messages(entity, limit=1):
+        newest_id = int(message.id)
+        break
+    if newest_id is None:
+        raise DurableStateError("source has no messages to seed")
+
+    rss_items: list[dict[str, str]] = []
+    if settings.rss_feed_url and settings.rss_target_channel:
+        rss_items = await rss_items_loader(settings.rss_feed_url)
+        if not rss_items:
+            raise DurableStateError("RSS feed has no items to seed")
+
+    rss_payload = None
+    if rss_items:
+        recent_ids: list[str] = []
+        for item in rss_items:
+            for key in item_keys(item):
+                if key not in recent_ids:
+                    recent_ids.append(key)
+                if len(recent_ids) >= settings.rss_recent_limit:
+                    break
+            if len(recent_ids) >= settings.rss_recent_limit:
+                break
+        rss_payload = _rss_payload(settings, rss_items[0]["id"], recent_ids)
+    _write_seed_transaction(
+        paths, _source_payload(settings, newest_id), rss_payload, state_writer
+    )
+    return OnceResult()
+
+
+async def _run_catch_up(
+    settings: Settings,
+    client: Any,
+    options: OnceOptions,
+    paths: StatePaths,
+    rss_items_loader: Any,
+    rss_post_builder: Any,
+    output: Any,
+    result: OnceResult,
+) -> OnceResult:
+    if options.shadow and not os.path.exists(paths.source):
+        source_state = _source_payload(settings, 0)
+    else:
+        source_state = _source_state(settings, paths.source)
+    rss_state = None
+    if settings.rss_feed_url and settings.rss_target_channel:
+        if options.shadow and not os.path.exists(paths.rss):
+            rss_state = _rss_payload(settings, "", [])
+        else:
+            rss_state = _rss_state(settings, paths.rss)
+
+    await client.start()
+    entity = await client.get_entity(normalize_chat_id(settings.source_chat) or settings.source_chat)
+    cursor = source_state["last_source_message_id"]
+    messages = await _collect_source_messages(
+        client, entity, cursor, options.max_source_items
+    )
+    for batch in _message_batches(messages):
+        result.source_inspected += len(batch)
+        eligible = [message for message in batch if not should_skip_message(settings, message)]
+        checkpoint = max(int(message.id) for message in batch)
+        if not eligible:
+            result.source_filtered += len(batch)
+            if not options.shadow:
+                source_state["last_source_message_id"] = checkpoint
+                save_state(paths.source, source_state)
+            continue
+
+        result.source_filtered += len(batch) - len(eligible)
+        result.source_selected += 1
+        ids = ",".join(str(message.id) for message in eligible)
+        output(f"source id={ids} destination={settings.target_channel}")
+        if options.shadow:
+            continue
+
+        first = eligible[0]
+        footer = build_footer(settings)
+        media = [message.media for message in eligible if has_media(message)]
+        if media:
+            files: Any = media if len(media) > 1 else media[0]
+            sent = await client.send_file(
+                settings.target_channel,
+                files,
+                caption=truncate_caption(merge_text(getattr(first, "raw_text", None), footer)),
+                formatting_entities=getattr(first, "entities", None),
+            )
+        else:
+            sent = await client.send_message(
+                settings.target_channel,
+                merge_text(getattr(first, "raw_text", None), footer),
+                formatting_entities=getattr(first, "entities", None),
+            )
+        if sent is None:
+            raise PrimarySendError(f"source send returned no result for id={ids}")
+        source_state["last_source_message_id"] = checkpoint
+        save_state(paths.source, source_state)
+        result.source_sent += 1
+        await _notify_best_effort(
+            client,
+            settings,
+            settings.notify_group_chats,
+            f"Опубликовано в {settings.target_channel}: source message_id={ids}",
+            result,
+            output,
+        )
+
+    if rss_state is None:
+        return result
+
+    items = await rss_items_loader(settings.rss_feed_url)
+    seen = set(rss_state["recent_ids"])
+    pending = _select_unseen_rss(items, seen, options.max_rss_items)
+    for item in pending:
+        result.rss_selected += 1
+        text = await rss_post_builder(item)
+        output(f"rss id={item['id']} destination={settings.rss_target_channel}")
+        if options.shadow:
+            continue
+        sent = await client.send_message(settings.rss_target_channel, text)
+        if sent is None:
+            raise PrimarySendError(f"RSS send returned no result for id={item['id']}")
+        updated_ids = item_keys(item) + [
+            value for value in rss_state["recent_ids"] if value not in item_keys(item)
+        ]
+        rss_state["last_seen_id"] = item["id"]
+        rss_state["recent_ids"] = updated_ids[: settings.rss_recent_limit]
+        save_state(paths.rss, rss_state)
+        result.rss_sent += 1
+        await _notify_best_effort(
+            client,
+            settings,
+            settings.notify_rss_chats,
+            f"Опубликовано в {settings.rss_target_channel}: RSS {item['title']}",
+            result,
+            output,
+        )
+    return result
+
+
+async def run_hourly(
+    settings: Settings,
+    client: Any,
+    options: OnceOptions,
+    paths: StatePaths,
+    rss_items_loader: Any = parse_rss_metadata_items,
+    rss_post_builder: Any = _default_rss_post_builder,
+    output: Any = print,
+    state_writer: Any = save_state,
+) -> OnceResult:
+    if options.seed_current and options.shadow:
+        raise ValueError("seed and shadow modes cannot be combined")
+    started_at = utc_now()
+    result = OnceResult()
+    connected = False
+    with single_instance(paths.lock, write_pid=not options.shadow, allow_missing=options.shadow):
+        if not options.shadow:
+            save_state(paths.health, _health_payload("running", result, started_at))
+        try:
+            async def execute() -> OnceResult:
+                nonlocal connected
+                if options.seed_current:
+                    seeded = await _seed_current(
+                        settings, client, options, paths, rss_items_loader, state_writer
+                    )
+                    connected = True
+                    return seeded
+                caught_up = await _run_catch_up(
+                    settings,
+                    client,
+                    options,
+                    paths,
+                    rss_items_loader,
+                    rss_post_builder,
+                    output,
+                    result,
+                )
+                connected = True
+                return caught_up
+
+            result = await asyncio.wait_for(execute(), timeout=options.deadline_seconds)
+            if not options.shadow:
+                status = "seeded" if options.seed_current else "succeeded"
+                save_state(
+                    paths.health,
+                    _health_payload(status, result, started_at, finished=True),
+                )
+            return result
+        except Exception as exc:
+            if not options.shadow:
+                error = "deadline exceeded" if isinstance(exc, asyncio.TimeoutError) else str(exc)
+                save_state(
+                    paths.health,
+                    _health_payload("failed", result, started_at, error=error, finished=True),
+                )
+            if isinstance(exc, (DurableStateError, PrimarySendError, asyncio.TimeoutError)):
+                raise
+            raise PrimarySendError(str(exc)) from exc
+        finally:
+            should_disconnect = connected or getattr(client, "started", False)
+            is_connected = getattr(client, "is_connected", None)
+            if callable(is_connected):
+                with contextlib.suppress(Exception):
+                    should_disconnect = should_disconnect or bool(is_connected())
+            if should_disconnect:
+                with contextlib.suppress(Exception):
+                    await client.disconnect()
+
+
+def _telegram_client(settings: Settings) -> TelegramClient:
+    return TelegramClient(
+        settings.session_name,
+        settings.api_id,
+        settings.api_hash,
+        device_model="Redmi Note 8T",
+        system_version="Android 11.0",
+        app_version="10.14.5",
+        lang_code="uk",
+    )
+
+
+async def daemon_main() -> None:
     settings = load_settings()
     require_nonempty(settings.api_hash, "API_HASH")
     require_nonempty(settings.source_chat, "SOURCE_CHAT")
     require_nonempty(settings.target_channel, "TARGET_CHANNEL")
+    paths = StatePaths.from_environment()
+    settings = replace(settings, rss_state_path=paths.rss)
 
-    with single_instance(LOCK_PATH):
+    with single_instance(paths.lock):
+        source_state = load_or_migrate_source_state(settings, paths)
         client = TelegramClient(
             settings.session_name, settings.api_id, settings.api_hash,
             device_model="Redmi Note 8T",
@@ -616,15 +1235,19 @@ async def main() -> None:
             "target_channel": settings.target_channel,
             "source_author_id": settings.source_author_id or "any",
             "rss_target_channel": settings.rss_target_channel or "off",
+            "last_source_message_id": source_state["last_source_message_id"],
             "last_error": "",
         }
-        save_state(HEALTH_PATH, health)
+        save_state(paths.health, health)
 
         def update_health(**fields: Any) -> None:
             health.update(fields)
             health["pid"] = os.getpid()
             health["last_heartbeat"] = utc_now()
-            save_state(HEALTH_PATH, health)
+            save_state(paths.health, health)
+
+        def checkpoint_source(message_id: int) -> None:
+            save_state(paths.source, _source_payload(settings, int(message_id)))
 
         async def heartbeat_loop() -> None:
             while True:
@@ -696,8 +1319,7 @@ async def main() -> None:
                                 seed_ids.extend(item_keys(item))
                             recent_ids = seed_ids[: settings.rss_recent_limit]
                             save_state(
-                                settings.rss_state_path,
-                                {"last_seen_id": last_seen_id, "recent_ids": recent_ids},
+                                settings.rss_state_path, _rss_payload(settings, last_seen_id, recent_ids)
                             )
                             print(f"rss initialized last_seen_id={last_seen_id}", flush=True)
                             update_health(last_rss_seen_id=last_seen_id)
@@ -707,27 +1329,43 @@ async def main() -> None:
                                 seeded_ids.extend(item_keys(item))
                             recent_ids = seeded_ids[: settings.rss_recent_limit]
                             save_state(
-                                settings.rss_state_path,
-                                {"last_seen_id": last_seen_id, "recent_ids": recent_ids},
+                                settings.rss_state_path, _rss_payload(settings, last_seen_id, recent_ids)
                             )
                             print(f"rss seeded recent_ids count={len(recent_ids)}", flush=True)
                             update_health(last_rss_seen_id=last_seen_id)
                         else:
-                            pending: list[dict[str, str]] = []
-                            for item in items:
-                                if any(key in recent_ids for key in item_keys(item)):
-                                    break
-                                pending.append(item)
-                            for item in reversed(pending):
-                                await send_with_retry(
-                                    f"rss:{settings.rss_target_channel}",
-                                    client.send_message,
-                                    settings.rss_target_channel,
-                                    format_rss_post(item),
-                                )
-                                await notify_many(
-                                    settings.notify_rss_chats,
-                                    f"Опубликовано в {settings.rss_target_channel}: RSS {item['title']}"
+                            pending = _select_unseen_rss(items, set(recent_ids), len(items))
+                            for item in pending:
+                                def checkpoint_rss(item: dict[str, str] = item) -> None:
+                                    nonlocal last_seen_id, recent_ids
+                                    keys = item_keys(item)
+                                    recent_ids = (
+                                        keys + [value for value in recent_ids if value not in keys]
+                                    )[: settings.rss_recent_limit]
+                                    last_seen_id = item["id"]
+                                    save_state(
+                                        settings.rss_state_path,
+                                        _rss_payload(settings, last_seen_id, recent_ids),
+                                    )
+                                    update_health(
+                                        last_rss_publish_at=utc_now(),
+                                        last_rss_publish_id=item["id"],
+                                        last_rss_publish_title=item["title"],
+                                        last_rss_seen_id=last_seen_id,
+                                    )
+                                await publish_primary(
+                                    lambda item=item: send_with_retry(
+                                        f"rss:{settings.rss_target_channel}",
+                                        client.send_message,
+                                        settings.rss_target_channel,
+                                        format_rss_post(item),
+                                    ),
+                                    checkpoint=checkpoint_rss,
+                                    notify=lambda item=item: notify_many(
+                                        settings.notify_rss_chats,
+                                        f"Опубликовано в {settings.rss_target_channel}: RSS {item['title']}",
+                                    ),
+                                    label=f"RSS {item['id']}",
                                 )
                                 print(f"rss published id={item['id']} title={item['title']}", flush=True)
                                 update_health(
@@ -741,8 +1379,7 @@ async def main() -> None:
                                 updated_ids.extend(item_keys(item))
                             recent_ids = updated_ids[: settings.rss_recent_limit]
                             save_state(
-                                settings.rss_state_path,
-                                {"last_seen_id": last_seen_id, "recent_ids": recent_ids},
+                                settings.rss_state_path, _rss_payload(settings, last_seen_id, recent_ids)
                             )
                             update_health(last_rss_seen_id=last_seen_id)
                     
@@ -767,63 +1404,65 @@ async def main() -> None:
             text = getattr(message, "raw_text", None)
             entities = getattr(message, "entities", None)
 
-            if text and not getattr(message, "media", None):
-                await send_with_retry(
-                    f"group:{settings.target_channel}:text",
-                    client.send_message,
-                    settings.target_channel,
-                    merge_text(text, footer),
-                    formatting_entities=entities,
-                )
-                await notify_many(
-                    settings.notify_group_chats,
-                    f"Опубликовано в {settings.target_channel}: text, source message_id={message.id}",
-                )
-                print(f"published message_id={message.id} text", flush=True)
+            def checkpoint(kind: str) -> None:
                 save_processed_id(message.id, commit=commit)
-                update_health(
-                    last_group_publish_at=utc_now(),
-                    last_group_publish_id=message.id,
-                    last_group_publish_kind="text",
-                )
-                return
-
-            if has_media(message):
-                kind = media_kind(message) or "unknown"
-                await send_with_retry(
-                    f"group:{settings.target_channel}:media",
-                    client.send_file,
-                    settings.target_channel,
-                    message.media,
-                    caption=truncate_caption(merge_text(text, footer)),
-                    formatting_entities=entities,
-                )
-                await notify_many(
-                    settings.notify_group_chats,
-                    f"Опубликовано в {settings.target_channel}: media={kind}, source message_id={message.id}"
-                )
-                print(f"published message_id={message.id} media={kind}", flush=True)
-                save_processed_id(message.id, commit=commit)
+                checkpoint_source(message.id)
                 update_health(
                     last_group_publish_at=utc_now(),
                     last_group_publish_id=message.id,
                     last_group_publish_kind=kind,
                 )
+
+            if text and not getattr(message, "media", None):
+                await publish_primary(
+                    lambda: send_with_retry(
+                        f"group:{settings.target_channel}:text",
+                        client.send_message,
+                        settings.target_channel,
+                        merge_text(text, footer),
+                        formatting_entities=entities,
+                    ),
+                    checkpoint=lambda: checkpoint("text"),
+                    notify=lambda: notify_many(
+                        settings.notify_group_chats,
+                        f"Опубликовано в {settings.target_channel}: text, source message_id={message.id}",
+                    ),
+                    label=f"source message {message.id}",
+                )
+                print(f"published message_id={message.id} text", flush=True)
+                return
+
+            if has_media(message):
+                kind = media_kind(message) or "unknown"
+                await publish_primary(
+                    lambda: send_with_retry(
+                        f"group:{settings.target_channel}:media",
+                        client.send_file,
+                        settings.target_channel,
+                        message.media,
+                        caption=truncate_caption(merge_text(text, footer)),
+                        formatting_entities=entities,
+                    ),
+                    checkpoint=lambda: checkpoint(kind),
+                    notify=lambda: notify_many(
+                        settings.notify_group_chats,
+                        f"Опубликовано в {settings.target_channel}: media={kind}, source message_id={message.id}",
+                    ),
+                    label=f"source message {message.id}",
+                )
+                print(f"published message_id={message.id} media={kind}", flush=True)
                 return
 
         async def catch_up() -> None:
-            prev_health = load_state(HEALTH_PATH)
-            last_id = prev_health.get("last_source_message_id")
-            if not last_id:
-                print("catch-up: no previous message id, skipping", flush=True)
-                return
-            
+            last_id = _source_state(settings, paths.source)["last_source_message_id"]
+
             print(f"catch-up: checking messages after id={last_id}", flush=True)
             try:
                 entity = await client.get_entity(source_chat_id or settings.source_chat)
                 count = 0
                 async for msg in client.iter_messages(entity, min_id=int(last_id), reverse=True):
                     if should_skip_message(settings, msg):
+                        checkpoint_source(msg.id)
                         continue
                     print(f"catch-up: processing missed message_id={msg.id}", flush=True)
                     await publish_message(msg, commit=False)
@@ -862,6 +1501,7 @@ async def main() -> None:
                     return
             if should_skip_message(settings, message):
                 print(f"skipped message_id={message.id}", flush=True)
+                checkpoint_source(message.id)
                 return
 
             update_health(last_source_message_at=utc_now(), last_source_message_id=message.id)
@@ -900,9 +1540,11 @@ async def main() -> None:
                         last_group_publish_id=grouped_id,
                         last_group_publish_kind=f"album:{len(files)}",
                     )
+                    checkpoint_source(max(item.id for item in messages))
                 return
 
             await publish_message(message)
+            checkpoint_source(message.id)
 
         # ─── Freelance channel monitoring ───
         FREELANCE_CHANNELS = env_list("FREELANCE_CHANNELS")
@@ -970,6 +1612,45 @@ async def main() -> None:
                 with contextlib.suppress(asyncio.CancelledError):
                     await rss_task
             update_health(status="stopped")
+
+
+async def cli_main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if not (args.once or args.seed_current or args.shadow):
+        await daemon_main()
+        return 0
+
+    settings = load_settings()
+    require_nonempty(settings.api_hash, "API_HASH")
+    require_nonempty(settings.source_chat, "SOURCE_CHAT")
+    require_nonempty(settings.target_channel, "TARGET_CHANNEL")
+    paths = StatePaths.from_environment()
+    settings = replace(settings, rss_state_path=paths.rss)
+    options = OnceOptions(
+        seed_current=args.seed_current,
+        force_reseed=args.force_reseed,
+        shadow=args.shadow,
+        max_source_items=args.max_source_items,
+        max_rss_items=args.max_rss_items,
+        deadline_seconds=args.deadline_seconds,
+    )
+    try:
+        result = await run_hourly(settings, _telegram_client(settings), options, paths)
+    except Exception as exc:
+        print(f"bridge oneshot failed: {exc}", file=sys.stderr, flush=True)
+        return 1
+    print(
+        "bridge oneshot complete",
+        f"source_sent={result.source_sent}",
+        f"rss_sent={result.rss_sent}",
+        f"notifications_failed={result.notification_failures}",
+        flush=True,
+    )
+    return 0
+
+
+async def main() -> None:
+    raise SystemExit(await cli_main())
 
 
 if __name__ == "__main__":

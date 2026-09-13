@@ -6,6 +6,7 @@ from collections import Counter
 from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from send_channel_report import (
     AISettings,
@@ -20,9 +21,12 @@ from send_channel_report import (
     extract_contextual_locations,
     format_change,
     format_daily_hour_chart,
+    get_hotspots,
+    get_risk_patterns,
     load_ai_settings,
     merge_place_history,
     reason_for_signal,
+    report_window,
     send_report_messages,
     strip_channel_boilerplate,
     telegram_text_units,
@@ -34,6 +38,18 @@ from report_novelty import UnusualSignal
 
 
 class ReportAnalyticsTests(unittest.TestCase):
+    def test_current_day_window_starts_at_kyiv_midnight_and_ends_now(self):
+        now_local = datetime(2026, 8, 30, 15, 45, tzinfo=ZoneInfo('Europe/Kyiv'))
+
+        start_utc, end_utc, local_start = report_window(
+            current_day=True,
+            now_local=now_local,
+        )
+
+        self.assertEqual(local_start, datetime(2026, 8, 30, tzinfo=ZoneInfo('Europe/Kyiv')))
+        self.assertEqual(start_utc, datetime(2026, 8, 29, 21, tzinfo=timezone.utc))
+        self.assertEqual(end_utc, datetime(2026, 8, 30, 12, 45, tzinfo=timezone.utc))
+
     def test_ai_settings_are_loaded_from_environment(self):
         with patch.dict(os.environ, {
             'REPORT_AI_URL': 'http://proxy.test/v1/messages',
@@ -366,6 +382,24 @@ class ReportAnalyticsTests(unittest.TestCase):
         hour_rows = [line for line in dashboard.splitlines() if re.match(r"\d{2}:00-\d{2}:00", line)]
         self.assertEqual(len(hour_rows), 24)
 
+    def test_current_day_dashboard_is_labeled_as_preliminary(self):
+        dashboard = build_dashboard(
+            history_posts=[],
+            title="Запорожье",
+            report_date=date(2026, 8, 30),
+            total_posts=10,
+            risk_posts=3,
+            event_counts=Counter(),
+            hourly_risk={},
+            weekly_hourly={},
+            comparison={},
+            is_current_day=True,
+        )
+
+        self.assertIn("Сегодня (30.08.2026), 00:00-сейчас", dashboard)
+        self.assertIn("Предварительная статистика", dashboard)
+        self.assertNotIn("Прогноз на завтра", dashboard)
+
     def test_weekend_comparison_uses_the_lower_average_as_baseline(self):
         dashboard = build_dashboard(
             history_posts=[],
@@ -468,7 +502,10 @@ class ReportAnalyticsTests(unittest.TestCase):
 
         self.assertEqual(
             history["АТБ - Пески"],
-            {"2026-08-26": 1, "2026-08-27": 1},
+            {
+                "2026-08-26": {"count": 1, "verified": False},
+                "2026-08-27": {"count": 1, "verified": False},
+            },
         )
 
     def test_location_history_does_not_drop_the_eighth_daily_location(self):
@@ -493,6 +530,31 @@ class ReportAnalyticsTests(unittest.TestCase):
         )
 
         self.assertEqual(len(history), 8)
+
+    def test_location_history_marks_two_sources_as_confirmed(self):
+        posts = [
+            PostStats(
+                1,
+                datetime(2026, 8, 27, 9, 0, tzinfo=timezone.utc),
+                0,
+                "Пески, полиция проверяет документы",
+                channel="Первый источник",
+            ),
+            PostStats(
+                2,
+                datetime(2026, 8, 27, 10, 0, tzinfo=timezone.utc),
+                0,
+                "Пески: полиция проверяет документы",
+                channel="Второй источник",
+            ),
+        ]
+
+        history = build_location_history(posts, date(2026, 8, 27), date(2026, 8, 27))
+        patterns = get_risk_patterns(history, min_days=1)
+
+        self.assertEqual(patterns[0]["total_mentions"], 2)
+        self.assertTrue(patterns[0]["verified"])
+        self.assertEqual(get_hotspots(history), [("Пески", 2)])
 
     def test_detail_report_keeps_points_repetition_and_quotes(self):
         detail = build_detail_report(

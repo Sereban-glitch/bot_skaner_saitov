@@ -539,7 +539,7 @@ def build_novelty_posts(posts: list[PostStats]) -> list[NoveltyPost]:
         ))
     return novelty_posts
 
-def format_unusual_signals(signals, reason_codes) -> str:
+def _legacy_format_unusual_signals(signals, reason_codes) -> str:
     if not signals:
         return ''
     kyiv_tz = ZoneInfo('Europe/Kyiv')
@@ -557,7 +557,7 @@ def format_unusual_signals(signals, reason_codes) -> str:
         lines.append("")
     return '\n'.join(lines).strip()
 
-def format_slang_candidates(candidates) -> str:
+def _legacy_format_slang_candidates(candidates) -> str:
     if not candidates:
         return ''
     lines = ['🆕 **Возможный новый сленг**']
@@ -567,7 +567,7 @@ def format_slang_candidates(candidates) -> str:
     return '\n'.join(lines)
 
 
-def analyze_daily_history(report_date, history: dict) -> dict:
+def _legacy_analyze_daily_history(report_date, history: dict) -> dict:
     dated_values = {
         datetime.strptime(day, '%Y-%m-%d').date(): data.get('risk_posts', 0)
         for day, data in history.items()
@@ -613,7 +613,7 @@ def analyze_daily_history(report_date, history: dict) -> dict:
 
 
 
-def merge_place_history(
+def _legacy_merge_place_history(
     data: dict,
     date_str: str,
     current_places: Counter,
@@ -635,7 +635,7 @@ def merge_place_history(
     return cleaned
 
 
-def update_danger_map(current_places: Counter, date_str: str | None = None):
+def _legacy_update_danger_map(current_places: Counter, date_str: str | None = None):
     data = {}
     if DANGER_MAP_FILE.exists():
         try:
@@ -650,7 +650,7 @@ def update_danger_map(current_places: Counter, date_str: str | None = None):
     return cleaned_data
 
 
-def update_risk_map(current_risk_places: Counter, date_str: str | None = None):
+def _legacy_update_risk_map(current_risk_places: Counter, date_str: str | None = None):
     """Update 7-day risk history: place -> {date: count}.
     Same shape as update_danger_map, but only for risk-context mentions.
     """
@@ -668,7 +668,7 @@ def update_risk_map(current_risk_places: Counter, date_str: str | None = None):
     return cleaned
 
 
-def get_risk_patterns(risk_map: dict, min_days: int = 3):
+def _legacy_get_risk_patterns(risk_map: dict, min_days: int = 3):
     patterns = []
     for place, days_data in risk_map.items():
         days_count = len(days_data)
@@ -687,7 +687,7 @@ def get_risk_patterns(risk_map: dict, min_days: int = 3):
     return patterns
 
 
-def analyze_time_patterns(posts: list, days: int = 7) -> dict:
+def _legacy_analyze_time_patterns(posts: list, days: int = 7) -> dict:
     """Analyze when risk events happen during the day (Kyiv timezone).
 
     Returns dict with:
@@ -730,7 +730,7 @@ def analyze_time_patterns(posts: list, days: int = 7) -> dict:
     }
 
 
-def format_hour_bar(count: int, max_count: int, width: int = 20) -> str:
+def _legacy_format_hour_bar(count: int, max_count: int, width: int = 20) -> str:
     """Format a horizontal bar chart for hour distribution."""
     if max_count == 0:
         return ''
@@ -738,7 +738,7 @@ def format_hour_bar(count: int, max_count: int, width: int = 20) -> str:
     return '█' * filled + '░' * (width - filled)
 
 
-def analyze_rss_posts(posts: list) -> dict:
+def _legacy_analyze_rss_posts(posts: list) -> dict:
     """Analyze posts that came from RSS (domdara.org).
     RSS posts typically:
       - Have AI-generated text (start with emoji like 🏛 ⚖ 📌 🛑)
@@ -772,14 +772,14 @@ def analyze_rss_posts(posts: list) -> dict:
     }
 
 
-def get_hotspots(map_data: dict):
+def _legacy_get_hotspots(map_data: dict):
     totals = Counter()
     for place, history in map_data.items():
         totals[place] = sum(history.values())
     return totals.most_common(5)
 
 
-def detect_risk_points(posts: list, limit: int | None = 7) -> list:
+def _legacy_detect_risk_points(posts: list, limit: int | None = 7) -> list:
     risk_place_posts = defaultdict(list)
 
     for post in posts:
@@ -817,7 +817,7 @@ def detect_risk_points(posts: list, limit: int | None = 7) -> list:
     return result
 
 
-def get_trend(current_score: int) -> str:
+def _legacy_get_trend(current_score: int) -> str:
     history = load_history()
     if not history:
         return "Первая запись статистики."
@@ -828,7 +828,7 @@ def get_trend(current_score: int) -> str:
     return f"{emoji} Тренд: {'+' if diff >= 0 else ''}{diff:.1f} к среднему (avg: {avg:.1f})"
 
 
-def local_day_start(now_local: datetime | None = None):
+def _legacy_local_day_start(now_local: datetime | None = None):
     tz = ZoneInfo("Europe/Kyiv")
     if now_local is None:
         now_local = datetime.now(tz)
@@ -838,8 +838,18 @@ def local_day_start(now_local: datetime | None = None):
     return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc), start_local
 
 
+def report_window(*, current_day: bool = False, now_local: datetime | None = None):
+    if not current_day:
+        return local_day_start(now_local)
+
+    tz = ZoneInfo("Europe/Kyiv")
+    now_local = (now_local or datetime.now(tz)).astimezone(tz)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(timezone.utc), now_local.astimezone(timezone.utc), start_local
+
+
 @dataclass
-class PostStats:
+class _LegacyPostStats:
     id: int
     date: datetime
     views: int
@@ -847,7 +857,7 @@ class PostStats:
     channel: str = ''
 
 
-def build_daily_summaries(posts: list[PostStats], start_date, end_date) -> dict:
+def _legacy_build_daily_summaries(posts: list[PostStats], start_date, end_date) -> dict:
     summaries = {}
     current = start_date
     while current <= end_date:
@@ -872,7 +882,7 @@ def build_daily_summaries(posts: list[PostStats], start_date, end_date) -> dict:
     return summaries
 
 
-def build_location_history(posts: list[PostStats], start_date, end_date) -> dict:
+def _legacy_build_location_history(posts: list[PostStats], start_date, end_date) -> dict:
     history = defaultdict(lambda: defaultdict(list))
     for post in posts:
         post_date = post.date.astimezone(KYIV_TZ).date()
@@ -1358,6 +1368,100 @@ def build_location_history(posts: list[PostStats], start_date, end_date) -> dict
     return history
 
 
+def detect_risk_points(posts: list, limit: int | None = 7) -> list:
+    risk_place_posts = defaultdict(list)
+    for post in posts:
+        text = post.text.lower()
+        if not is_risk_post(text):
+            continue
+        locations = extract_contextual_locations(post.text)
+        if locations:
+            for place in locations:
+                risk_place_posts[place].append(post)
+            continue
+        for place in RISK_PLACE_KEYWORDS:
+            if place not in GENERIC_PLACE_KEYWORDS and place in text:
+                risk_place_posts[place].append(post)
+
+    result = []
+    for place, place_posts in risk_place_posts.items():
+        unique_texts = set()
+        deduplicated = []
+        for post in place_posts:
+            if post.text not in unique_texts:
+                unique_texts.add(post.text)
+                deduplicated.append(post)
+        if deduplicated:
+            result.append((place, len(deduplicated), {"posts": deduplicated}))
+    result.sort(key=lambda item: item[1], reverse=True)
+    return result if limit is None else result[:limit]
+
+
+def build_location_history(posts: list[PostStats], start_date, end_date) -> dict:
+    history = defaultdict(lambda: defaultdict(list))
+    for post in posts:
+        post_date = post.date.astimezone(KYIV_TZ).date()
+        if not start_date <= post_date <= end_date or not is_risk_post(post.text.lower()):
+            continue
+        locations = extract_contextual_locations(post.text)
+        if not locations:
+            locations = [
+                place for place in RISK_PLACE_KEYWORDS
+                if place not in GENERIC_PLACE_KEYWORDS and place in post.text.lower()
+            ]
+        for location in set(locations):
+            history[location][post_date.isoformat()].append(post)
+
+    result = defaultdict(dict)
+    for location, days in history.items():
+        for date_str, location_posts in days.items():
+            unique_texts = set()
+            deduplicated = []
+            for post in location_posts:
+                if post.text not in unique_texts:
+                    unique_texts.add(post.text)
+                    deduplicated.append(post)
+            confirmed = any(
+                first.channel != second.channel
+                and abs((first.date - second.date).total_seconds()) <= 7200
+                for index, first in enumerate(deduplicated)
+                for second in deduplicated[index + 1:]
+                if first.channel and second.channel
+            )
+            result[location][date_str] = {
+                "count": len(deduplicated),
+                "verified": confirmed,
+            }
+    return dict(result)
+
+
+def get_risk_patterns(risk_map: dict, min_days: int = 3) -> list[dict]:
+    patterns = []
+    for place, days_data in risk_map.items():
+        if len(days_data) < min_days:
+            continue
+        patterns.append({
+            "place": place,
+            "days_count": len(days_data),
+            "total_mentions": sum(day["count"] for day in days_data.values()),
+            "last_seen": max(days_data),
+            "verified": any(day["verified"] for day in days_data.values()),
+        })
+    return sorted(
+        patterns,
+        key=lambda pattern: (pattern["days_count"], pattern["total_mentions"]),
+        reverse=True,
+    )
+
+
+def get_hotspots(map_data: dict):
+    totals = Counter({
+        place: sum(day["count"] for day in days.values())
+        for place, days in map_data.items()
+    })
+    return totals.most_common(5)
+
+
 def build_dashboard(
     history_posts: list[PostStats],
     *,
@@ -1369,29 +1473,143 @@ def build_dashboard(
     hourly_risk: dict[int, int],
     weekly_hourly: dict[int, int],
     comparison: dict,
+    is_current_day: bool = False,
 ) -> str:
-    tomorrow = report_date + timedelta(days=2)
-    safety = calculate_safety_windows(history_posts, tomorrow)
+    def display_number(value) -> str:
+        return f'{value:g}'.replace('.', ',')
 
-    level, level_score = situation_level(event_counts)
-    trend_sign = "+" if comparison["last_14_avg"] > comparison["prev_14_avg"] else ""
-    if comparison["last_14_avg"] < comparison["prev_14_avg"]: trend_sign = "-"
-    trend_icon = "📈" if comparison["last_14_avg"] >= comparison["prev_14_avg"] else "📉"
-    
     lines = [
-        f"📊 Аналитика: {title}",
-        f"📅 Дата: {report_date:%Y-%m-%d}",
-        f"🔴 Обстановка: {level}",
-        f"{trend_icon} Тренд: {trend_sign}{abs(comparison['last_14_avg'] - comparison['prev_14_avg']):.1f} к среднему (avg: {comparison['last_14_avg']:.1f})",
+        f'📊 **Статистика и прогноз: {title}**',
+        (
+            f'📅 Сегодня ({report_date:%d.%m.%Y}), 00:00-сейчас по Киеву'
+            if is_current_day
+            else f'📅 Вчера ({report_date:%d.%m.%Y}), 00:00-24:00 по Киеву'
+        ),
         "",
-        f"📝 Сообщений: {total_posts}",
-        f"⚠️ Опасных сигналов: {risk_posts}",
-        "",
-        f"🛡 Прогноз на завтра ({safety['day_type']}):",
-        "✅ Окна затишья:\n" + safety['safe_windows'],
-        "⛔ Высокий риск:\n" + safety['high_risk'],
-        "🌙 Комендантский час: 00:00-05:00",
+        f'📝 Всего сообщений в канале: {total_posts}',
+        f'⚠️ Сообщений о проверках: {risk_posts}',
     ]
+    if is_current_day:
+        lines.append('⚠️ Предварительная статистика: день ещё не завершён.')
+    else:
+        tomorrow = report_date + timedelta(days=2)
+        safety = calculate_safety_windows(history_posts, tomorrow)
+        lines.extend([
+            '',
+            f'🛡 **Прогноз на завтра ({safety["day_type"]}, на базе 90 дней):**',
+            f'✅ Окна затишья: {safety["safe_windows"]}',
+            f'⛔ Высокий риск: {safety["high_risk"]}',
+            '🌙 Комендантский час: 00:00-05:00 (любые перемещения опасны)',
+        ])
+
+    if event_counts:
+        lines.append('')
+        lines.append('**Что упоминали:**')
+        for label, count in event_counts.most_common():
+            lines.append(f'- {label}: {count}')
+        lines.append('_Одно сообщение может относиться к нескольким категориям._')
+
+    lines.extend(['', '**Сравнение простыми словами:**'])
+    previous_day = comparison.get('previous_day')
+    if previous_day is not None:
+        lines.append(f'- {format_change(risk_posts, previous_day, "позавчера")}')
+
+    weekday_average = comparison.get('weekday_average')
+    if weekday_average is not None:
+        weekday_labels = [
+            'в обычный понедельник', 'в обычный вторник', 'в обычную среду',
+            'в обычный четверг', 'в обычную пятницу', 'в обычную субботу',
+            'в обычное воскресенье',
+        ]
+        weekday_change = format_change(
+            risk_posts, weekday_average, weekday_labels[report_date.weekday()]
+        )
+        lines.append(
+            f'- По истории за 90 дней: {weekday_change[:1].lower()}{weekday_change[1:]}'
+        )
+
+    last_7 = comparison.get('last_7_total', 0)
+    previous_7 = comparison.get('previous_7_total', 0)
+    lines.append(f'- За последние 7 дней: {last_7}.')
+    if previous_7 is not None:
+        lines.append(f'- {format_change(last_7, previous_7, "за предыдущие 7 дней")}')
+
+    workday_average = comparison.get('workday_average')
+    weekend_average = comparison.get('weekend_average')
+    if workday_average is not None and weekend_average is not None:
+        lower_average = min(workday_average, weekend_average)
+        if lower_average:
+            difference = round(
+                abs(workday_average - weekend_average) / lower_average * 100
+            )
+            higher = 'в будни' if workday_average >= weekend_average else 'в выходные'
+            lines.append(
+                f'- По истории за 90 дней: в будни в среднем '
+                f'{display_number(workday_average)} сообщения в день, '
+                f'в выходные {display_number(weekend_average)}; '
+                f'{higher} активность выше примерно на {difference}%.'
+            )
+        elif workday_average == 0 and weekend_average > 0:
+            lines.append(
+                f'- По истории за 90 дней: в будни упоминаний не было, '
+                f'в выходные в среднем {display_number(weekend_average)} в день.'
+            )
+        elif weekend_average == 0 and workday_average > 0:
+            lines.append(
+                f'- По истории за 90 дней: в выходные упоминаний не было, '
+                f'в будни в среднем {display_number(workday_average)} в день.'
+            )
+        elif workday_average == 0 and weekend_average == 0:
+            lines.append('- По истории за 90 дней: упоминаний не было ни в будни, ни в выходные.')
+
+    last_14_average = comparison.get('last_14_average')
+    previous_14_average = comparison.get('previous_14_average')
+    if last_14_average is not None and previous_14_average is not None:
+        if previous_14_average:
+            change_percent = round(
+                abs(last_14_average - previous_14_average) / previous_14_average * 100
+            )
+            if last_14_average > previous_14_average:
+                direction = 'выросла'
+            elif last_14_average < previous_14_average:
+                direction = 'снизилась'
+            else:
+                direction = 'не изменилась'
+            lines.append(
+                f'- Долгосрочно: средняя дневная активность {direction} '
+                f'на {change_percent}%: {display_number(last_14_average)} '
+                f'за последние 14 дней против '
+                f'{display_number(previous_14_average)} за предыдущие 14.'
+            )
+        elif last_14_average > 0:
+            lines.append(
+                f'- Долгосрочно: за предыдущие 14 дней упоминаний не было; '
+                f'за последние 14 дней в среднем {display_number(last_14_average)} в день.'
+            )
+        else:
+            lines.append(
+                '- Долгосрочно: упоминаний не было ни за последние, '
+                'ни за предыдущие 14 дней.'
+            )
+
+    lines.extend([
+        '',
+        '**Активность по часам за сегодня:**' if is_current_day else '**Активность по часам за предыдущий день:**',
+        format_daily_hour_chart(hourly_risk),
+    ])
+    if any(weekly_hourly.values()):
+        lines.extend(['', '**Пиковые часы за последние 7 дней:**'])
+        weekly_peak = sorted(
+            ((hour, count) for hour, count in weekly_hourly.items() if count > 0),
+            key=lambda item: -item[1],
+        )[:3]
+        peak_count = weekly_peak[0][1]
+        for hour, count in weekly_peak:
+            lines.append(
+                f'- {hour:02d}:00-{hour + 1:02d}:00 '
+                f'{format_hour_bar(count, peak_count, width=12)} {count}'
+            )
+    lines.extend(['', '💡 Это статистика публичных упоминаний, возможны неполные данные.'])
     return "\n".join(lines)
 
 def situation_level(event_counts: Counter) -> tuple[str, int]:
@@ -1420,7 +1638,11 @@ async def send_report_messages(
     return 2
 
 
-async def main(preview: bool = False):
+async def main(
+    preview: bool = False,
+    current_day: bool = False,
+    report_chat_override: str | None = None,
+):
     config_dir = Path(os.environ.get('REPORT_CONFIG_DIR', BASE_DIR))
     load_dotenv(config_dir / '.env')
     session_path = str(config_dir / 'analytics.session')
@@ -1428,8 +1650,10 @@ async def main(preview: bool = False):
     await client.start()
 
     channel_ref = env('CHANNEL_REPORT_TARGET')
-    report_chat = env('CHANNEL_REPORT_CHAT', DEFAULT_REPORT_CHAT)
-    start_utc, end_utc, local_report_day = local_day_start()
+    if current_day and not preview and not report_chat_override:
+        raise ValueError('Current-day reports may only be sent to an explicit test chat.')
+    report_chat = report_chat_override or env('CHANNEL_REPORT_CHAT', DEFAULT_REPORT_CHAT)
+    start_utc, end_utc, local_report_day = report_window(current_day=current_day)
 
     report_date = local_report_day.date()
     history_start_date = report_date - timedelta(days=90)
@@ -1495,7 +1719,7 @@ async def main(preview: bool = False):
         )
         current_summary = daily_summaries[report_date.isoformat()]
         comparison = analyze_daily_history(report_date, daily_summaries)
-        if not preview:
+        if not preview and not current_day:
             for day_key, summary in daily_summaries.items():
                 update_daily_history(DAILY_HISTORY_FILE, day_key, summary)
 
@@ -1572,6 +1796,7 @@ async def main(preview: bool = False):
             hourly_risk=hourly_risk,
             weekly_hourly=dict(weekly_hourly),
             comparison=comparison,
+            is_current_day=current_day,
         )
 
         detail = build_detail_report(
@@ -1610,5 +1835,21 @@ if __name__ == '__main__':
         action='store_true',
         help='Print both report messages without sending or updating history.',
     )
+    parser.add_argument(
+        '--preview-current-day',
+        action='store_true',
+        help='Print a report from today 00:00 Kyiv time through now without updating history.',
+    )
+    parser.add_argument(
+        '--send-test-to',
+        metavar='CHAT',
+        help='Send a current-day test report to CHAT without updating history.',
+    )
     args = parser.parse_args()
-    asyncio.run(main(preview=args.preview))
+    if args.preview and (args.preview_current_day or args.send_test_to):
+        parser.error('--preview cannot be combined with current-day test options')
+    asyncio.run(main(
+        preview=args.preview or args.preview_current_day,
+        current_day=args.preview_current_day or bool(args.send_test_to),
+        report_chat_override=args.send_test_to,
+    ))
