@@ -25,6 +25,7 @@ from telethon.tl.types import MessageEntityBotCommand, MessageMediaWebPage
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROCESSED_PATH = os.path.join(BASE_DIR, "processed_ids.json")
+TELEGRAM_TEXT_LIMIT = 4096
 
 def truncate_caption(caption: str | None, limit: int = 1024) -> str | None:
     if caption and len(caption) > limit:
@@ -219,6 +220,69 @@ class RSSFeedError(RuntimeError):
 
 class LockBusyError(RuntimeError):
     pass
+
+
+def telegram_text_units(text: str) -> int:
+    """Return Telegram's UTF-16 code-unit length for a text message."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def split_telegram_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """Split text without losing characters, preferring whitespace boundaries."""
+    if limit < 1:
+        raise ValueError("Telegram text limit must be positive")
+    if not text:
+        return [""]
+
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        units = 0
+        hard_end = start
+        while hard_end < len(text):
+            char_units = telegram_text_units(text[hard_end])
+            if units + char_units > limit:
+                break
+            units += char_units
+            hard_end += 1
+
+        if hard_end == len(text):
+            chunks.append(text[start:])
+            break
+        if hard_end == start:
+            raise ValueError("Telegram text limit is smaller than one character")
+
+        # Do not create a tiny leading chunk merely because an early space exists.
+        preferred = max(
+            text.rfind("\n", start + 1, hard_end),
+            text.rfind(" ", start + 1, hard_end),
+        )
+        if preferred >= start + max(1, (hard_end - start) // 2):
+            hard_end = preferred + 1
+        chunks.append(text[start:hard_end])
+        start = hard_end
+    return chunks
+
+
+async def send_telegram_text(
+    send_message: Any,
+    chat: Any,
+    text: str,
+    *,
+    formatting_entities: Any = None,
+) -> Any:
+    """Send one or more valid Telegram messages and return the last result."""
+    chunks = split_telegram_text(text)
+    last_sent = None
+    for chunk in chunks:
+        kwargs: dict[str, Any] = {}
+        # Original entity offsets remain valid only when the text was not split.
+        if len(chunks) == 1 and formatting_entities is not None:
+            kwargs["formatting_entities"] = formatting_entities
+        last_sent = await send_message(chat, chunk, **kwargs)
+        if last_sent is None:
+            return None
+    return last_sent
 
 
 def load_settings() -> Settings:
@@ -1074,7 +1138,8 @@ async def _run_catch_up(
                 formatting_entities=getattr(first, "entities", None),
             )
         else:
-            sent = await client.send_message(
+            sent = await send_telegram_text(
+                client.send_message,
                 settings.target_channel,
                 merge_text(getattr(first, "raw_text", None), footer),
                 formatting_entities=getattr(first, "entities", None),
@@ -1105,7 +1170,9 @@ async def _run_catch_up(
         output(f"rss id={item['id']} destination={settings.rss_target_channel}")
         if options.shadow:
             continue
-        sent = await client.send_message(settings.rss_target_channel, text)
+        sent = await send_telegram_text(
+            client.send_message, settings.rss_target_channel, text
+        )
         if sent is None:
             raise PrimarySendError(f"RSS send returned no result for id={item['id']}")
         updated_ids = item_keys(item) + [
@@ -1181,6 +1248,15 @@ async def run_hourly(
                     paths.health,
                     _health_payload("failed", result, started_at, error=error, finished=True),
                 )
+                if settings.notify_chat:
+                    await _notify_best_effort(
+                        client,
+                        settings,
+                        (settings.notify_chat,),
+                        f"⚠️ Сканер сайтів: годинний запуск завершився помилкою: {error[:1000]}",
+                        result,
+                        output,
+                    )
             if isinstance(exc, (DurableStateError, PrimarySendError, asyncio.TimeoutError)):
                 raise
             raise PrimarySendError(str(exc)) from exc
@@ -1308,7 +1384,7 @@ async def daemon_main() -> None:
 
             while True:
                 try:
-                    items = await parse_rss_items(settings.rss_feed_url)
+                    items = await parse_rss_metadata_items(settings.rss_feed_url)
                     update_health(last_rss_check_at=utc_now())
                     if items:
                         newest_id = items[0]["id"]
@@ -1336,6 +1412,9 @@ async def daemon_main() -> None:
                         else:
                             pending = _select_unseen_rss(items, set(recent_ids), len(items))
                             for item in pending:
+                                item["excerpt"] = await build_rss_excerpt(
+                                    item["description"], item["content"], item["link"]
+                                )
                                 def checkpoint_rss(item: dict[str, str] = item) -> None:
                                     nonlocal last_seen_id, recent_ids
                                     keys = item_keys(item)
@@ -1356,6 +1435,7 @@ async def daemon_main() -> None:
                                 await publish_primary(
                                     lambda item=item: send_with_retry(
                                         f"rss:{settings.rss_target_channel}",
+                                        send_telegram_text,
                                         client.send_message,
                                         settings.rss_target_channel,
                                         format_rss_post(item),
@@ -1417,6 +1497,7 @@ async def daemon_main() -> None:
                 await publish_primary(
                     lambda: send_with_retry(
                         f"group:{settings.target_channel}:text",
+                        send_telegram_text,
                         client.send_message,
                         settings.target_channel,
                         merge_text(text, footer),
