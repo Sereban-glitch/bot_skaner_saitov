@@ -613,7 +613,7 @@ async def analyze_with_ai(html_content: str) -> str:
             # IMPORTANT: proxy at :18080 is antigravity-claude-proxy (Anthropic API format)
             # NOT OpenAI. Use /v1/messages with top-level "system" field.
             payload = {
-                "model": os.environ.get("REPORT_AI_MODEL", "gemini-3.7-flash-tiered"),
+                "model": os.environ.get("REPORT_AI_MODEL", "gemini-3.8-flash-tiered"),
                 "max_tokens": 4000,
                 "system": "Ты — профессиональный Telegram-редактор и аналитик. Твоя задача — делать крутые посты-выжимки, фильтровать агрессию, смещать акценты на суть прецедента. Тон нейтральный и объективный. ВСЕГДА включай номер дела отдельной строкой.",
                 "messages": [{"role": "user", "content": prompt}],
@@ -654,7 +654,12 @@ async def analyze_with_ai(html_content: str) -> str:
     return "FALLBACK"
 
 
+def _ends_cleanly(text: str) -> bool:
+    return bool(re.search(r"""[.!?…»]["')\s]*$""", text))
+
+
 def extract_article_excerpt(article_html: str) -> str:
+    meta_text = ""
     for pattern in [
         r'<meta\s+property=["\']og:description["\']\s+content=["\'](.*?)["\']',
         r'<meta\s+name=["\']description["\']\s+content=["\'](.*?)["\']',
@@ -663,7 +668,8 @@ def extract_article_excerpt(article_html: str) -> str:
         if match:
             text = strip_html(match.group(1))
             if text:
-                return text
+                meta_text = text
+                break
 
     paragraphs = re.findall(r"<p[^>]*>(.*?)</p>", article_html, re.I | re.S)
     chunks: list[str] = []
@@ -674,7 +680,17 @@ def extract_article_excerpt(article_html: str) -> str:
         chunks.append(text)
         if len(" ".join(chunks)) >= 450:
             break
-    return shorten(" ".join(chunks), 650)
+    paras_text = shorten(" ".join(chunks), 650) if chunks else ""
+
+    # Site meta descriptions are sometimes cut mid-word (SEO plugins).
+    # Prefer a complete meta text, otherwise fall back to article paragraphs.
+    if meta_text and _ends_cleanly(meta_text):
+        return meta_text
+
+    fallback = paras_text or meta_text
+    if fallback and not _ends_cleanly(fallback):
+        fallback = fallback.rstrip(" .,;:—-") + "…"
+    return fallback
 
 
 async def build_rss_excerpt(description: str, content: str, link: str) -> str:
@@ -768,6 +784,9 @@ def format_rss_post(item: dict[str, str]) -> str:
     parts = []
     title = item.get("title", "").strip()
     excerpt = item.get("excerpt", "").strip()
+    # AI models mark list items with "* "; Telegram shows those literally,
+    # while the channel style uses "•".
+    excerpt = re.sub(r"(?m)^\s*\*\s+", "• ", excerpt)
     # If excerpt already starts with title (AI-generated post), skip duplicating title
     if title and not (excerpt and excerpt.startswith(title)):
         parts.append(title)
@@ -1724,6 +1743,11 @@ async def cli_main(argv: list[str] | None = None) -> int:
     )
     try:
         result = await run_hourly(settings, _telegram_client(settings), options, paths)
+    except LockBusyError:
+        # The daemon is running and holds the lock: this hourly fallback run
+        # is not needed. Exit 0 so systemd does not report a failure.
+        print("bridge oneshot skipped: daemon is running", flush=True)
+        return 0
     except Exception as exc:
         print(f"bridge oneshot failed: {exc}", file=sys.stderr, flush=True)
         return 1
