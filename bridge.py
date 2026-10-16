@@ -1567,7 +1567,12 @@ async def daemon_main() -> None:
                 print("audit: checking for missed messages...", flush=True)
                 try:
                     entity = await client.get_entity(source_chat_id or settings.source_chat)
+                    source_cursor = int(
+                        _source_state(settings, paths.source)["last_source_message_id"]
+                    )
                     async for msg in client.iter_messages(entity, limit=20):
+                        if int(msg.id) <= source_cursor:
+                            continue
                         if not should_skip_message(settings, msg):
                             await publish_message(msg)
                 except Exception as exc:
