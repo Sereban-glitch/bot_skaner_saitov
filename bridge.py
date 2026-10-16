@@ -148,6 +148,7 @@ class Settings:
     rss_poll_seconds: float
     rss_state_path: str
     rss_recent_limit: int
+    error_notify_chat: str = ""
 
 
 @dataclass(frozen=True)
@@ -305,6 +306,7 @@ def load_settings() -> Settings:
         rss_poll_seconds=env_float("RSS_POLL_SECONDS", "300"),
         rss_state_path=env("RSS_STATE_PATH", ".rss-state.json"),
         rss_recent_limit=env_int("RSS_RECENT_LIMIT", "30"),
+        error_notify_chat=env("ERROR_NOTIFY_CHAT"),
     )
 
 
@@ -1248,11 +1250,11 @@ async def run_hourly(
                     paths.health,
                     _health_payload("failed", result, started_at, error=error, finished=True),
                 )
-                if settings.notify_chat:
+                if settings.error_notify_chat:
                     await _notify_best_effort(
                         client,
                         settings,
-                        (settings.notify_chat,),
+                        (settings.error_notify_chat,),
                         f"⚠️ Сканер сайтів: годинний запуск завершився помилкою: {error[:1000]}",
                         result,
                         output,
