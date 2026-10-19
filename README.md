@@ -97,5 +97,10 @@ python3 send_mtproto_message.py --to @username --message "Bridge is healthy"
 - `RSS_RECENT_LIMIT` controls how many recent RSS identifiers are kept for deduplication.
 - The bridge keeps a lock file in `/root/telegram-mtproto-bridge/bridge.lock` so a second copy does not start by mistake.
 - Runtime health is written to `/root/telegram-mtproto-bridge/bridge.health.json`.
-- `healthcheck.sh` can be run manually or on a schedule later to restart the bridge if the process died or the heartbeat became stale.
 - The script is intentionally small and uses only Telethon plus the Python standard library.
+
+## Связанные проекты / Интеграция с видеоконвейером
+
+Логика опроса RSS (`http://domdara.org/feed/`), дедупликации и извлечения номеров судебных дел (`bridge.py`) используется в автономном видеоконвейере **[Tubecook v4](https://github.com/Sereban-glitch/tubecook)** для автоматической генерации Shorts/Reels/Telegram-видео:
+- Спецификация адаптера сбора: [SPEC_DOMDARA_INGEST.md](https://github.com/Sereban-glitch/tubecook/blob/main/docs/SPEC_DOMDARA_INGEST.md)
+- Памятка состояния и аппаратных замеров: [MEMO_STATUS.md](https://github.com/Sereban-glitch/tubecook/blob/main/docs/MEMO_STATUS.md)
