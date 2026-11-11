@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily backup of the power schedule bot to GitHub
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+Unit=power-schedule-backup.service
+
+[Install]
+WantedBy=timers.target

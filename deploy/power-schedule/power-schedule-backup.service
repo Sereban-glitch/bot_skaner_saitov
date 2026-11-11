@@ -1,0 +1,13 @@
+[Unit]
+Description=Backup power schedule bot to GitHub
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/home/u0_a566/bot_skaner_saitov/deploy/power-schedule/backup.sh
+
+[Service]
+Type=oneshot
+User=u0_a566
+Group=u0_a566
+WorkingDirectory=/home/u0_a566/bot_skaner_saitov
+Environment=HOME=/home/u0_a566
+ExecStart=/home/u0_a566/bot_skaner_saitov/deploy/power-schedule/backup.sh
