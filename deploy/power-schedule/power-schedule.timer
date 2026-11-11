@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Zaporizhzhia Power Schedule Monitor every 2 minutes
+
+[Timer]
+OnCalendar=*:0/2
+AccuracySec=10s
+Persistent=true
+Unit=power-schedule.service
+
+[Install]
+WantedBy=timers.target

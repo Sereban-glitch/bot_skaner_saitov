@@ -43,3 +43,12 @@ GEMINI.md
 *.bak*
 bridge_patched.py
 patch_bridge.py
+
+# Power schedule bot runtime
+power_schedule.log*
+power_schedule_state.json
+backups/
+
+# Any Telegram session files are secrets
+*.session
+*.session-journal

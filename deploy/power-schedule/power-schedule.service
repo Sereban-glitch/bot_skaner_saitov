@@ -1,0 +1,31 @@
+[Unit]
+Description=Zaporizhzhia Power Schedule Monitor & Family Alert
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/home/u0_a566/bot_skaner_saitov/power_schedule.py
+
+[Service]
+Type=oneshot
+User=u0_a566
+Group=u0_a566
+WorkingDirectory=/home/u0_a566/bot_skaner_saitov
+
+Environment=HOME=/home/u0_a566
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+ExecStart=/home/u0_a566/bot_skaner_saitov/.venv/bin/python /home/u0_a566/bot_skaner_saitov/power_schedule.py
+
+TimeoutSec=90
+MemoryHigh=128M
+MemoryMax=256M
+TasksMax=32
+Nice=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
