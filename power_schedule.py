@@ -3,10 +3,8 @@
 Power Schedule Monitor for Zaporizhzhia (GPV)
 Scans @Zaporizhzhyaoblenergo_news for power schedules,
 posts structured summaries to @svobodnye_ludi_zp,
-and sends personalized alerts for queue 1.2 to family members:
-- Sergey (@sereban_tech)
-- Ksyusha (@Ksuhavorobey)
-- Miron (@depicTOMii)
+and sends personalized alerts for queue 1.2 to the recipients
+configured in POWER_RECIPIENTS (see deploy/power-schedule/README.md).
 
 Updates are delivered in-place: the channel post is edited, personal
 messages are re-sent (so the recipient gets a push) and the previous
@@ -59,6 +57,21 @@ def load_dotenv(path: Path) -> None:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
+def load_recipients() -> list[tuple[str, str]]:
+    """Parse POWER_RECIPIENTS: comma-separated key:@username pairs."""
+    raw = os.getenv("POWER_RECIPIENTS", "")
+    recipients: list[tuple[str, str]] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        key, username = part.split(":", 1)
+        key, username = key.strip(), username.strip()
+        if key and username:
+            recipients.append((key, username))
+    return recipients
 
 
 def parse_schedule(text: str) -> dict:
@@ -375,24 +388,28 @@ async def run_sync(
             print("=" * 50)
             print("\n--- CHANNEL POST (@svobodnye_ludi_zp) ---")
             print(channel_post)
-            print("\n--- SERGEY (@sereban_tech) ---")
-            print(personal_msgs["sergey"])
-            print("\n--- KSYUSHA (@Ksuhavorobey) ---")
-            print(personal_msgs["ksusha"])
-            print("\n--- MIRON (@depicTOMii) ---")
-            print(personal_msgs["miron"])
+            recipient_map = dict(load_recipients())
+            for key, text in personal_msgs.items():
+                username = recipient_map.get(key, "not configured")
+                print(f"\n--- {key.upper()} ({username}) ---")
+                print(text)
             print("=" * 50 + "\n")
             return
 
         if test_pm_only:
-            logger.info("Sending TEST PM to Sergey (@sereban_tech)...")
+            configured = load_recipients()
+            if not configured:
+                logger.error("POWER_RECIPIENTS is empty; cannot send a test PM.")
+                return
+            test_key, test_username = configured[0]
+            logger.info(f"Sending TEST PM to the first configured recipient ({test_key})...")
             test_text = (
                 "🧪 ТЕСТОВЫЙ ПРОГОН МОДУЛЯ ГРАФИКОВ СВЕТА ⚡️\n\n"
-                + personal_msgs["sergey"]
+                + personal_msgs.get(test_key, personal_msgs["sergey"])
                 + "\n\n(Это тестовое сообщение, отправлено только тебе)."
             )
-            await client.send_message("@sereban_tech", test_text)
-            logger.info("Test PM sent successfully to @sereban_tech!")
+            await client.send_message(test_username, test_text)
+            logger.info("Test PM sent successfully.")
             return
 
         # 1. Channel post: edit the previous one, do not multiply messages.
@@ -412,10 +429,12 @@ async def run_sync(
 
         # 2. Personal PMs: new message (push) + delete the previous one
         recipients = [
-            ("@sereban_tech", personal_msgs["sergey"], "Sergey", "sergey"),
-            ("@Ksuhavorobey", personal_msgs["ksusha"], "Ksyusha", "ksusha"),
-            ("@depicTOMii", personal_msgs["miron"], "Miron", "miron"),
+            (username, personal_msgs[key], key.capitalize(), key)
+            for key, username in load_recipients()
+            if key in personal_msgs
         ]
+        if not recipients:
+            logger.warning("POWER_RECIPIENTS is empty or invalid; skipping personal messages.")
 
         for username, text, label, key in recipients:
             try:
@@ -442,7 +461,7 @@ async def run_sync(
 def main():
     parser = argparse.ArgumentParser(description="Power Schedule Monitor")
     parser.add_argument("--preview", action="store_true", help="Print formatted messages without sending")
-    parser.add_argument("--test-pm", action="store_true", help="Send a test PM only to Sergey (@sereban_tech)")
+    parser.add_argument("--test-pm", action="store_true", help="Send a test PM only to the first configured recipient")
     parser.add_argument("--force", action="store_true", help="Ignore last hash and force send")
     parser.add_argument("--ignore-quiet-hours", action="store_true", help="Send even during quiet hours (23:00-07:00)")
     parser.add_argument("--target-channel", default="@svobodnye_ludi_zp", help="Target channel")
