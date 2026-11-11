@@ -52,3 +52,10 @@ POWER_RECIPIENTS=sergey:@username1,ksusha:@username2,miron:@username3
 
 `analytics.session` и `.env` не восстанавливаются из GitHub — это секреты.
 После переезда на новую машину сессию нужно авторизовать заново.
+
+## Резервное копирование
+
+Код автоматически сохраняется в GitHub раз в сутки (04:00 UTC) таймером
+`power-schedule-backup.timer`. Если файлы изменились, скрипт `backup.sh`
+делает коммит и пуш. Секреты (`.env`, `analytics.session`) в репозиторий
+не попадают.
